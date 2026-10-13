@@ -8,7 +8,8 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-FROM node:20-alpine AS frontend-builder
+# Build static assets natively and share them across target architectures.
+FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend-builder
 
 WORKDIR /frontend
 COPY frontend/package.json frontend/package-lock.json ./
