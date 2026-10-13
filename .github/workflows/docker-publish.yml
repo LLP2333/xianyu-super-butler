@@ -5,25 +5,29 @@
 # 内存不够时直接 OOM，表现为"部署不上、机器卡死"。
 # 有了预构建镜像，这些设备只需要 pull，几分钟就能起来。
 #
-# 发布后镜像地址：ghcr.io/<owner>/xianyu-super-butler:latest
+# 自用分支发布：ghcr.io/llp2333/xianyu-super-butler:personal
+# 每次同时发布 sha-<完整提交号>，部署时可固定版本。
 # 首次发布后需要到仓库 Packages 页面把镜像设为 Public，否则 pull 需要登录。
 
-name: Publish Docker image
+name: Publish personal Docker image
 
 on:
   push:
-    tags:
-      - 'v*'
     branches:
-      - main
+      - personal
   workflow_dispatch:
+
+concurrency:
+  group: publish-personal-image
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: llp2333/xianyu-super-butler
 
 jobs:
   build-and-push:
+    if: github.repository == 'LLP2333/xianyu-super-butler' && github.ref == 'refs/heads/personal'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -52,10 +56,10 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          flavor: latest=false
           tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=ref,event=tag
-            type=semver,pattern={{version}}
+            type=raw,value=personal
+            type=sha,format=long
 
       - name: Build and push
         uses: docker/build-push-action@v6

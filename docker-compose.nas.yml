@@ -13,11 +13,16 @@
 #
 # 使用前请注意：默认账号是 admin / admin123，登录后立刻改密码。
 #
-# 启动：docker compose -f docker-compose.nas.yml up -d
+# 使用 personal 分支在你自己的 GitHub 仓库构建的镜像。
+# 首次使用前推送 personal，等待 Publish personal Docker image 成功。
+# 默认跟随 personal；固定版本时将下方标签改成 sha-<完整提交号>。
+# 更新并启动：
+#   docker compose -f docker-compose.nas.yml pull
+#   docker compose -f docker-compose.nas.yml up -d
 
 services:
   xianyu-app:
-    image: ghcr.io/23star/xianyu-super-butler:latest
+    image: ghcr.io/llp2333/xianyu-super-butler:personal
     container_name: xianyu-super-butler
     restart: unless-stopped
     ports:
