@@ -6,7 +6,7 @@
 2. _wait_for_captcha_present 检测到滑块，而不是把“没滑块”误判成“已完成”
 3. 用户通过远程控制通道拖动滑块，滑块消失后取回 Cookie
 
-真实场景里惩罚 URL 由 _fetch_live_verification_url / get_verification_url 提供；
+真实场景里惩罚 URL 由 request_manual_token 提供；
 这里直接用本地文件 URL 模拟，验证流程本身正确。
 """
 
@@ -34,6 +34,7 @@ async def _run_flow():
     playwright = await async_playwright().start()
     browser = await playwright.chromium.launch(
         headless=True,
+        channel="chromium",
         args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
     )
     try:
@@ -55,19 +56,25 @@ async def _run_flow():
         box_bbox = await box_handle.bounding_box()
         start_x = box_bbox["x"] + 20
         y = box_bbox["y"] + 20
-        await page.mouse.move(start_x, y)
-        await page.mouse.down()
+        origin = captcha_controller.active_sessions['mock-account']['clip']
+        assert origin and origin['x'] > 0 and origin['y'] > 0
+        # The image displayed at half scale must map back to the same page point.
+        displayed_x = (start_x - origin['x']) / 2
+        displayed_y = (y - origin['y']) / 2
+        await captcha_controller.handle_mouse_event('mock-account', 'down',
+            round(displayed_x * 2 + origin['x']), round(displayed_y * 2 + origin['y']))
         # 分步拖动，模拟真实手势
         for step in range(1, 9):
-            await page.mouse.move(start_x + step * 55, y + 2, steps=3)
+            await captcha_controller.handle_mouse_event('mock-account', 'move', start_x + step * 55, y + 2)
             await asyncio.sleep(0.05)
-        await page.mouse.up()
+        await captcha_controller.handle_mouse_event('mock-account', 'up', start_x + 450, y + 2)
 
         # 4. 滑块应消失 → 验证完成
         await asyncio.sleep(1)
         completed = await captcha_controller.check_completion("mock-account")
         return {"ok": completed, "stage": "done" if completed else "not_completed"}
     finally:
+        await captcha_controller.close_session('mock-account')
         await browser.close()
         await playwright.stop()
 
@@ -85,6 +92,7 @@ class ManualCaptchaFlowTests(unittest.TestCase):
             async with async_playwright() as p:
                 browser = await p.chromium.launch(
                     headless=True,
+                    channel="chromium",
                     args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
                 )
                 try:
@@ -106,6 +114,7 @@ class ManualCaptchaFlowTests(unittest.TestCase):
             async with async_playwright() as p:
                 browser = await p.chromium.launch(
                     headless=True,
+                    channel="chromium",
                     args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
                 )
                 try:

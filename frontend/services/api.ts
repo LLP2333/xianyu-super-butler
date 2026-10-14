@@ -337,19 +337,9 @@ export const getRiskControlStatus = async (): Promise<{
   return get('/api/risk-control/status');
 };
 
-// 实时取一个新鲜的验证链接。punish 链接的 x5secdata 只能用一次、约 1 小时失效，
-// 直接用风控日志里的历史链接打开只会看到「抱歉，页面访问出现了问题」。
-export const requestFreshCaptchaUrl = async (cookieId: string): Promise<{
-  success: boolean;
-  need_verify: boolean;
-  verification_url?: string;
-  message: string;
-}> => {
-  return post(`/api/risk-control/${encodeURIComponent(cookieId)}/fresh-captcha-url`);
-};
-
 export const startManualCaptchaSession = async (
   cookieId: string,
+  sessionId: string,
   timeout: number = 300,
 ): Promise<{
   success: boolean;
@@ -359,7 +349,8 @@ export const startManualCaptchaSession = async (
   const formData = new FormData();
   formData.append('cookie_id', cookieId);
   formData.append('timeout', String(timeout));
-  return post('/api/captcha/manual-session', formData, { timeout: (timeout + 30) * 1000 });
+  formData.append('session_id', sessionId);
+  return post('/api/captcha/manual-session', formData, { timeout: (timeout + 180) * 1000 });
 };
 
 // 商品擦亮：重新获取搜索曝光，平台对每日次数有限制

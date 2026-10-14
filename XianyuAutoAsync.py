@@ -2364,7 +2364,7 @@ class XianyuLive:
                                         from app.db_manager import db_manager
                                         db_manager.update_risk_control_log(
                                             log_id=log_id,
-                                            processing_result=f"滑块验证失败，耗时: {captcha_duration:.2f}秒, 原因: 未获取到新cookies",
+                                            processing_result=f"滑块验证失败，耗时: {captcha_duration:.2f}秒, 原因: {self.last_captcha_failure}",
                                             processing_status='failed'
                                         )
                                     except Exception as update_e:
@@ -2578,6 +2578,7 @@ class XianyuLive:
 
     async def _handle_captcha_verification(self, res_json: dict) -> str:
         """处理滑块验证，返回新的cookies字符串"""
+        self.last_captcha_failure = "[challenge_fetch] 未取得验证链接"
         try:
             logger.info(f"【{self.cookie_id}】开始处理滑块验证...")
 
@@ -2616,27 +2617,29 @@ class XianyuLive:
                     headless=slider_headless
                 )
 
-                # 在线程池中执行滑块验证
-                import asyncio
-                import concurrent.futures
+                # Do not use a ThreadPoolExecutor context here: cancellation would
+                # synchronously join its worker and freeze the entire asyncio loop.
+                verification_task = asyncio.create_task(asyncio.to_thread(
+                    slider_stealth.run, verification_url, self.cookies_str
+                ))
+                try:
+                    success, cookies = await asyncio.shield(verification_task)
+                except asyncio.CancelledError:
+                    slider_stealth.cancel_requested = True
+                    await asyncio.to_thread(slider_stealth._kill_browser_process)
+                    try:
+                        await asyncio.wait_for(asyncio.shield(verification_task), timeout=10)
+                    except asyncio.TimeoutError:
+                        logger.warning(f"【{self.cookie_id}】旧验证线程仍在清理，取消标记将阻止其继续验证")
+                    raise
 
-                loop = asyncio.get_event_loop()
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    # 执行滑块验证。必须把账号 Cookie 一并传入 ——
-                    # 惩罚页的 x5secdata 绑定账号会话，不带 Cookie 时即使滑块拖过，
-                    # 回收到的也只是空浏览器凭证，风控不会解除。
-                    success, cookies = await loop.run_in_executor(
-                        executor,
-                        slider_stealth.run,
-                        verification_url,
-                        self.cookies_str
-                    )
-
+                self.last_captcha_failure = getattr(slider_stealth, 'failure_reason', '[slider] 自动验证未返回凭证')
                 if success and cookies:
                     # 边界防御：只有 x5sec 才是通行凭证。x5secdata / x5sectag 是挑战
                     # 标记，必然存在，不能拿它们当验证通过的证据 —— 否则会把一堆
                     # 挑战 cookie 写回账号，token 刷新永远 FAIL_SYS_USER_VALIDATE。
                     if 'x5sec' not in {k.lower() for k in cookies}:
+                        self.last_captcha_failure = '[cookie_collect] 返回 Cookie 缺少 x5sec'
                         logger.error(
                             f"【{self.cookie_id}】滑块返回的 cookie 中没有 x5sec，"
                             f"视觉通过但服务端未放行，按失败处理。"
@@ -2763,6 +2766,7 @@ class XianyuLive:
                     return None
 
             except ImportError as import_e:
+                self.last_captcha_failure = '[browser_start] 验证器依赖加载失败'
                 logger.error(f"【{self.cookie_id}】XianyuSliderStealth导入失败: {import_e}")
                 logger.error(f"【{self.cookie_id}】请安装Playwright库: pip install playwright")
 
@@ -2778,6 +2782,7 @@ class XianyuLive:
                 return None
 
             except Exception as stealth_e:
+                self.last_captcha_failure = f'[browser] 验证执行异常（{type(stealth_e).__name__}）'
                 logger.error(f"【{self.cookie_id}】滑块验证异常: {self._safe_str(stealth_e)}")
 
                 # 记录异常到日志文件

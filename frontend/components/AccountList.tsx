@@ -18,7 +18,6 @@ import {
   refreshAccountProfile,
   getRiskControlStatus,
   startManualCaptchaSession,
-  requestFreshCaptchaUrl,
 } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
 import {Power, Edit2, Trash2, QrCode, X, Check, Loader2, MessageSquare, RefreshCw, Save, User, Clock, Key, Eye, EyeOff, Bot, Settings, MapPin, Users, ShieldCheck} from 'lucide-react';
@@ -49,15 +48,18 @@ const AccountList: React.FC = () => {
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [editingAccount, setEditingAccount] = useState<AccountDetail | null>(null);
   const [refreshingProfileId, setRefreshingProfileId] = useState<string | null>(null);
-  // 正在取新验证链接的账号
-  const [freshUrlLoadingId, setFreshUrlLoadingId] = useState<string | null>(null);
   const [manualCaptchaId, setManualCaptchaId] = useState<string | null>(null);
   // 人工滑块验证弹窗：把服务器端浏览器的画面镜像到本页
   const [captchaAccount, setCaptchaAccount] = useState<AccountDetail | null>(null);
   const [captchaShot, setCaptchaShot] = useState('');
-  const [captchaStage, setCaptchaStage] = useState<'starting' | 'ready' | 'done' | 'failed'>('starting');
+  const [captchaStage, setCaptchaStage] = useState<'starting' | 'ready' | 'verifying' | 'done' | 'failed'>('starting');
   const [captchaMessage, setCaptchaMessage] = useState('');
   const captchaWsRef = useRef<WebSocket | null>(null);
+  const captchaSessionRef = useRef('');
+  const captchaOriginRef = useRef({ x: 0, y: 0 });
+  const captchaVerifyingRef = useRef(false);
+  const captchaFinishedRef = useRef(false);
+  const captchaPointerRef = useRef<number | null>(null);
   const captchaImgRef = useRef<HTMLImageElement>(null);
   const [failedAvatars, setFailedAvatars] = useState<Set<string>>(new Set());
 
@@ -154,33 +156,6 @@ const AccountList: React.FC = () => {
     loadAccounts();
   };
 
-  // 点按钮时实时取链接，而不是用风控日志里的历史链接 ——
-  // punish 链接的 x5secdata 只能用一次、约 1 小时失效，
-  // 旧链接打开只会看到「抱歉，页面访问出现了问题」。
-  const handleOpenFreshCaptcha = async (id: string) => {
-    setFreshUrlLoadingId(id);
-    try {
-      const result = await requestFreshCaptchaUrl(id);
-      if (!result.need_verify) {
-        notify(result.message || '该账号风控已解除，无需验证', 'success');
-        await loadAccounts({ silent: true });
-        const status = await getRiskControlStatus();
-        setRiskBlocked((status.accounts || []).filter(
-          item => item.blocked || (item.verification_type && item.verification_type !== 'none')
-        ));
-        return;
-      }
-      if (result.verification_url) {
-        window.open(result.verification_url, '_blank', 'noopener,noreferrer');
-        notify('已打开验证页，请用鼠标拖动滑块完成验证', 'info');
-      }
-    } catch (error) {
-      notify(error instanceof Error ? error.message : '获取验证链接失败', 'error');
-    } finally {
-      setFreshUrlLoadingId(null);
-    }
-  };
-
   const handleRefreshProfile = async (id: string) => {
     setRefreshingProfileId(id);
     try {
@@ -210,6 +185,14 @@ const AccountList: React.FC = () => {
   // 鼠标事件再回传驱动服务器上的真实浏览器 —— 相当于把远端浏览器镜像到这里。
   // 这样部署在没有桌面的服务器上也能人工过验证，不需要访问服务器屏幕。
   const handleManualCaptcha = async (account: AccountDetail) => {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 15) | 64;
+    bytes[8] = (bytes[8] & 63) | 128;
+    const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+    captchaSessionRef.current = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+    captchaOriginRef.current = { x: 0, y: 0 };
+    captchaVerifyingRef.current = false;
+    captchaFinishedRef.current = false;
     setCaptchaAccount(account);
     setCaptchaShot('');
     setCaptchaStage('starting');
@@ -217,20 +200,29 @@ const AccountList: React.FC = () => {
     setManualCaptchaId(account.id);
 
     try {
-      const result = await startManualCaptchaSession(account.id);
+      const result = await startManualCaptchaSession(account.id, captchaSessionRef.current);
       if (!result.success) throw new Error(result.message || '人工验证未完成');
+      captchaFinishedRef.current = true;
       setCaptchaStage('done');
       setCaptchaMessage(result.message || '验证完成，账号 Cookie 已更新');
       notify(result.message || '人工验证完成，账号 Cookie 已更新', 'success');
-      const status = await getRiskControlStatus();
-      setRiskBlocked((status.accounts || []).filter(item => item.blocked || (item.verification_type && item.verification_type !== 'none')));
-      await loadAccounts({ silent: true });
+      try {
+        const status = await getRiskControlStatus();
+        setRiskBlocked((status.accounts || []).filter(item => item.blocked || (item.verification_type && item.verification_type !== 'none')));
+        await loadAccounts({ silent: true });
+      } catch {
+        notify('账号已完成验证，但列表刷新失败，请刷新页面查看状态', 'info');
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : '人工验证启动失败';
       setCaptchaStage('failed');
       setCaptchaMessage(msg);
       notify(msg, 'error');
     } finally {
+      captchaFinishedRef.current = true;
+      captchaVerifyingRef.current = true;
+      captchaPointerRef.current = null;
+      captchaWsRef.current?.close();
       setManualCaptchaId(null);
     }
   };
@@ -248,14 +240,16 @@ const AccountList: React.FC = () => {
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     const connect = () => {
-      if (closed) return;
+      if (closed || captchaFinishedRef.current) return;
+      timer = undefined;
       const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
       const ws = new WebSocket(
-        `${scheme}://${location.host}/api/captcha/ws/${encodeURIComponent(captchaAccount.id)}`
+        `${scheme}://${location.host}/api/captcha/ws/${encodeURIComponent(captchaSessionRef.current)}`
       );
       captchaWsRef.current = ws;
 
       ws.onmessage = event => {
+        if (closed || captchaFinishedRef.current || captchaWsRef.current !== ws) return;
         let data: any;
         try {
           data = JSON.parse(event.data);
@@ -263,29 +257,36 @@ const AccountList: React.FC = () => {
           return;
         }
         if (data.type === 'session_info' || data.type === 'screenshot_update') {
+          if (data.origin) captchaOriginRef.current = data.origin;
           if (data.screenshot) {
             setCaptchaShot(
               String(data.screenshot).startsWith('data:')
                 ? data.screenshot
                 : `data:image/jpeg;base64,${data.screenshot}`
             );
-            setCaptchaStage('ready');
-            setCaptchaMessage('按住滑块向右拖动完成验证');
+            if (data.type === 'session_info') {
+              captchaVerifyingRef.current = data.phase === 'verifying';
+              setCaptchaStage(data.phase === 'verifying' ? 'verifying' : 'ready');
+              setCaptchaMessage(data.message);
+            }
           }
-        } else if (data.type === 'completed') {
-          setCaptchaStage('done');
-          setCaptchaMessage('验证通过，正在回收 Cookie…');
+        } else if (data.type === 'verifying') {
+          captchaVerifyingRef.current = true;
+          setCaptchaStage('verifying');
+          setCaptchaMessage(data.message);
+        } else if (data.type === 'retry') {
+          captchaVerifyingRef.current = false;
+          setCaptchaStage('ready');
+          setCaptchaMessage(data.message);
         } else if (data.type === 'error') {
-          // 会话尚未建立时后端会立刻返回 error，稍后重试即可
-          if (retry < 20) {
-            retry += 1;
-            timer = setTimeout(connect, 1000);
-          }
+          setCaptchaMessage(data.message || '验证通道异常，正在重新连接…');
+          ws.close();
         }
+
       };
 
       ws.onclose = () => {
-        if (!closed && retry < 20) {
+        if (!closed && !captchaFinishedRef.current && !timer && retry < 20) {
           retry += 1;
           timer = setTimeout(connect, 1000);
         }
@@ -302,10 +303,10 @@ const AccountList: React.FC = () => {
   }, [captchaAccount]);
 
   // 把本页的鼠标坐标换算成服务器端浏览器的坐标后回传
-  const sendCaptchaMouse = (eventType: 'down' | 'move' | 'up', e: React.MouseEvent) => {
+  const sendCaptchaMouse = (eventType: 'down' | 'move' | 'up', e: React.PointerEvent) => {
     const ws = captchaWsRef.current;
     const img = captchaImgRef.current;
-    if (!ws || ws.readyState !== WebSocket.OPEN || !img || !img.naturalWidth) return;
+    if (captchaVerifyingRef.current || !ws || ws.readyState !== WebSocket.OPEN || !img || !img.naturalWidth) return;
 
     const rect = img.getBoundingClientRect();
     // 截图在页面上被等比缩放显示，坐标要按缩放比还原回原始分辨率
@@ -314,8 +315,8 @@ const AccountList: React.FC = () => {
     ws.send(JSON.stringify({
       type: 'mouse_event',
       event_type: eventType,
-      x: Math.round(x),
-      y: Math.round(y),
+      x: Math.round(x + captchaOriginRef.current.x),
+      y: Math.round(y + captchaOriginRef.current.y),
     }));
   };
 
@@ -569,12 +570,12 @@ const AccountList: React.FC = () => {
                 {' '}
                 {Math.max(1, Math.ceil(Math.max(...riskBlocked.map(a => a.remaining_seconds || 0)) / 60))}
                 {' '}
-                分钟后恢复。此期间请勿频繁操作 —— 持续请求会让验证状态持续更久。
+                分钟后允许重试，是否恢复以 Token 确认结果为准；也可使用下方「人工验证」。
               </>
             ) : (
               <>
                 {' '}本地冷却已结束，但闲鱼仍要求完成验证。请用下方账号卡片里的
-                「在我的浏览器打开验证页」用真实鼠标过一次滑块，通过后会自动恢复。
+                「人工验证」完成滑块，系统取得 Token 后会恢复账号任务。
               </>
             )}
           </p>
@@ -678,29 +679,7 @@ const AccountList: React.FC = () => {
                     用同一个闲鱼账号重新扫码，即可覆盖并恢复该账号。
                   </p>
                 )}
-                {/* 闲鱼要求人机验证时给出「自己浏览器打开」的入口。
-                    服务器端用 CDP 拖滑块通过率很低（风控查的是合并前子事件密度，
-                    自动化派发每帧只有一个），用真实鼠标过一次要可靠得多。 */}
-                {blockedState?.verification_url && (
-                  <div className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
-                    <p className="font-bold">闲鱼要求完成人机验证，账号暂时拿不到令牌</p>
-                    <p className="mt-1">
-                      推荐用你自己的浏览器打开验证页、用真实鼠标拖动滑块，通过率远高于服务器自动拖动。
-                      验证通过后本页会自动恢复，无需重新扫码。
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => handleOpenFreshCaptcha(account.id)}
-                      disabled={freshUrlLoadingId === account.id}
-                      className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-[#ffe100] px-3 py-1.5 font-bold text-[#2a2416] hover:bg-[#ffd700] disabled:opacity-60"
-                    >
-                      {freshUrlLoadingId === account.id
-                        ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                        : <ShieldCheck className="h-3.5 w-3.5" />}
-                      在我的浏览器打开验证页
-                    </button>
-                  </div>
-                )}
+
               </div>
             </div>
             <div className="flex items-center justify-end gap-1 border-t border-gray-100 pt-3 sm:border-0 sm:pt-0">
@@ -1197,7 +1176,16 @@ const AccountList: React.FC = () => {
               </div>
               <button
                 type="button"
-                onClick={() => setCaptchaAccount(null)}
+                onClick={() => {
+                  if (manualCaptchaId) {
+                    captchaWsRef.current?.send(JSON.stringify({ type: 'cancel' }));
+                    setCaptchaMessage('正在结束验证并恢复账号任务…');
+                  } else {
+                    setCaptchaAccount(null);
+                  }
+                }}
+                disabled={captchaStage === 'starting'}
+                title={manualCaptchaId ? '取消验证' : '关闭'}
                 className="rounded-md p-2 hover:bg-gray-100"
                 aria-label="关闭"
               >
@@ -1214,7 +1202,7 @@ const AccountList: React.FC = () => {
                   操作会回传到服务器驱动真实浏览器 —— 因此部署在无桌面的服务器上也能用。
                 </p>
                 <p className="mt-1">
-                  验证通过后系统会自动回收新的登录凭证，账号立即恢复运行。
+                  操作完成后系统会回收登录凭证并请求 Token；确认成功后才恢复账号任务。
                 </p>
               </div>
 
@@ -1236,10 +1224,31 @@ const AccountList: React.FC = () => {
                     alt="服务器端验证页面"
                     draggable={false}
                     className="max-h-[460px] w-auto cursor-crosshair select-none rounded"
-                    onMouseDown={e => { e.preventDefault(); sendCaptchaMouse('down', e); }}
-                    onMouseMove={e => { if (e.buttons === 1) sendCaptchaMouse('move', e); }}
-                    onMouseUp={e => sendCaptchaMouse('up', e)}
-                    onMouseLeave={e => { if (e.buttons === 1) sendCaptchaMouse('up', e); }}
+                    style={{ touchAction: 'none' }}
+                    onPointerDown={e => {
+                      if (captchaStage !== 'ready' || e.button !== 0 || captchaPointerRef.current !== null) return;
+                      e.preventDefault();
+                      captchaPointerRef.current = e.pointerId;
+                      e.currentTarget.setPointerCapture(e.pointerId);
+                      sendCaptchaMouse('down', e);
+                    }}
+                    onPointerMove={e => {
+                      if (captchaPointerRef.current === e.pointerId) sendCaptchaMouse('move', e);
+                    }}
+                    onPointerUp={e => {
+                      if (captchaPointerRef.current !== e.pointerId) return;
+                      sendCaptchaMouse('up', e);
+                      captchaPointerRef.current = null;
+                      e.currentTarget.releasePointerCapture(e.pointerId);
+                    }}
+                    onLostPointerCapture={e => {
+                      if (captchaPointerRef.current === e.pointerId) sendCaptchaMouse('up', e);
+                      captchaPointerRef.current = null;
+                    }}
+                    onPointerCancel={e => {
+                      if (captchaPointerRef.current === e.pointerId) sendCaptchaMouse('up', e);
+                      captchaPointerRef.current = null;
+                    }}
                   />
                 ) : (
                   <div className="text-center text-sm text-gray-500">
@@ -1261,7 +1270,16 @@ const AccountList: React.FC = () => {
             <div className="modal-footer flex justify-end">
               <button
                 type="button"
-                onClick={() => setCaptchaAccount(null)}
+                onClick={() => {
+                  if (manualCaptchaId) {
+                    captchaWsRef.current?.send(JSON.stringify({ type: 'cancel' }));
+                    setCaptchaMessage('正在结束验证并恢复账号任务…');
+                  } else {
+                    setCaptchaAccount(null);
+                  }
+                }}
+                disabled={captchaStage === 'starting'}
+                title={manualCaptchaId ? '取消验证' : '关闭'}
                 className="ios-btn-secondary rounded-md px-4 py-2 text-sm"
               >
                 关闭

@@ -825,10 +825,12 @@ class XianyuSliderStealth:
                     f"【{self.pure_user_id}】❌ 取 cookie 前发现 URL 仍在 punish，"
                     f"验证未真正通过: {current_url[:120]}"
                 )
+                self.failure_reason = '[cookie_collect] 页面仍停留在验证页，未确认通过'
                 return None
 
             cookies = self.context.cookies()
             if not cookies:
+                self.failure_reason = "[cookie_collect] 浏览器未返回任何 Cookie"
                 logger.warning(f"【{self.pure_user_id}】未获取到任何cookie")
                 return None
 
@@ -850,6 +852,7 @@ class XianyuSliderStealth:
             )
 
             if 'x5sec' not in filtered_cookies:
+                self.failure_reason = '[cookie_collect] Cookie 中缺少 x5sec，未取得有效凭证'
                 logger.error(
                     f"【{self.pure_user_id}】❌ x5 cookie 中没有 x5sec，"
                     f"滑块视觉通过但服务端并未放行。已有key: "
@@ -864,6 +867,7 @@ class XianyuSliderStealth:
             return filtered_cookies
 
         except Exception as e:
+            self.failure_reason = f'[cookie_collect] 读取 Cookie 异常（{type(e).__name__}）'
             logger.error(f"【{self.pure_user_id}】获取滑块验证成功后的cookie失败: {str(e)}")
             return None
     
@@ -4290,7 +4294,7 @@ class XianyuSliderStealth:
             try:
                 import subprocess
                 subprocess.run(
-                    ['pkill', '-f', marker],
+                    ['pkill', '-f', marker_pattern.pattern],
                     check=False, timeout=10,
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
@@ -4347,16 +4351,22 @@ class XianyuSliderStealth:
                          x5sec 不绑定该账号，风控不会解除。
             timeout: 整体超时（秒），超时强制关闭浏览器。默认 SLIDER_RUN_TIMEOUT。
         """
+        self.failure_reason = '[slider] 自动滑块未通过'
         cookies = None
         watchdog = self._start_watchdog(timeout or SLIDER_RUN_TIMEOUT)
         try:
+            if getattr(self, 'cancel_requested', False):
+                return False, None
             # 检查日期有效性
             if not self._check_date_validity():
                 logger.error(f"【{self.pure_user_id}】日期验证失败，无法执行")
+                self.failure_reason = '[precheck] 验证器前置检查失败'
                 return False, None
 
             # 初始化浏览器
             self.init_browser()
+            if getattr(self, 'cancel_requested', False):
+                return False, None
 
             # 注入账号 Cookie —— 惩罚页的 x5secdata 绑定的是账号会话，
             # 不带 Cookie 时即便滑块拖过，回收到的也只是空浏览器凭证（实测仅 164 字符），
@@ -4420,6 +4430,8 @@ class XianyuSliderStealth:
                 logger.info(f"【{self.pure_user_id}】页面内容包含验证码相关关键词")
                 
                 # 处理滑块验证
+                if getattr(self, 'cancel_requested', False):
+                    return False, None
                 success = self.solve_slider()
                 
                 if success:
@@ -4449,9 +4461,11 @@ class XianyuSliderStealth:
                 return success, cookies
             else:
                 logger.info(f"【{self.pure_user_id}】页面内容不包含验证码相关关键词，可能不需要验证")
-                return True, None
+                self.failure_reason = '[captcha_detect] 页面未识别到验证码，无法确认通过'
+                return False, None
                 
         except Exception as e:
+            self.failure_reason = f'[browser] 自动验证执行异常（{type(e).__name__}）'
             logger.error(f"【{self.pure_user_id}】执行过程中出错: {str(e)}")
             return False, None
         finally:

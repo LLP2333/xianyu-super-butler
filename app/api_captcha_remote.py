@@ -40,135 +40,88 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await websocket.accept()
     logger.info(f"🔌 WebSocket 连接建立: {session_id}")
     
-    # 注册 WebSocket 连接
-    captcha_controller.websocket_connections[session_id] = websocket
+    from collections import deque
+
+    pending = deque()
+    ready = asyncio.Event()
+    worker = None
+
+    async def apply_input():
+        while True:
+            await ready.wait()
+            while pending:
+                event = pending.popleft()
+                if not await captcha_controller.handle_mouse_event(
+                    session_id, event['event_type'], event['x'], event['y']
+                ):
+                    await websocket.send_json({'type': 'error', 'message': '鼠标操作失败，请重新开启人工验证'})
+            ready.clear()
 
     try:
-        # 发送初始会话信息
-        # 后端 start_manual_captcha → open_manual_session 要先抢 browser_limit 槽位
-        # 才能打开浏览器截图建会话，前端 WebSocket 可能比会话创建先到。原实现在
-        # 会话不存在时立即发 error + close，前端静默重连但看不到任何反馈，
-        # 弹窗一直停在「正在服务器上打开验证页面」。这里改为轮询等待最多 30 秒，
-        # 给后端足够时间完成浏览器启动和截图。
-        if session_id not in captcha_controller.active_sessions:
-            wait_deadline = time.monotonic() + 30
-            while time.monotonic() < wait_deadline:
-                await asyncio.sleep(1)
-                if session_id in captcha_controller.active_sessions:
-                    break
-            else:
-                await websocket.send_json({
-                    'type': 'error',
-                    'message': '会话创建超时，可能是服务器繁忙或浏览器启动失败，请稍后重试'
-                })
-                await websocket.close()
+        deadline = time.monotonic() + 90
+        while session_id not in captcha_controller.active_sessions:
+            if time.monotonic() >= deadline:
+                await websocket.send_json({'type': 'error', 'message': '验证会话启动超时'})
                 return
+            await asyncio.sleep(0.2)
 
-        if session_id in captcha_controller.active_sessions:
-            session_data = captcha_controller.active_sessions[session_id]
-            await websocket.send_json({
-                'type': 'session_info',
-                'screenshot': session_data['screenshot'],
-                'captcha_info': session_data['captcha_info'],
-                'viewport': session_data['viewport']
-            })
-            
-            # 不启动自动刷新，改为只在操作时更新（极速优化）
-            # refresh_task = asyncio.create_task(
-            #     captcha_controller.auto_refresh_screenshot(session_id, interval=1.5)
-            # )
-        else:
-            await websocket.send_json({
-                'type': 'error',
-                'message': '会话不存在'
-            })
-            await websocket.close()
-            return
-        
-        # 持续接收客户端消息
+        previous = captcha_controller.websocket_connections.get(session_id)
+        if previous and previous is not websocket:
+            await previous.close()
+        captcha_controller.websocket_connections[session_id] = websocket
+        session = captcha_controller.active_sessions[session_id]
+        await websocket.send_json({
+            'type': 'session_info', 'screenshot': session['screenshot'],
+            'origin': session['clip'] or {'x': 0, 'y': 0},
+            'viewport': session['viewport'],
+            'phase': session.get('phase', 'ready'),
+            'message': session.get('message', '按住滑块向右拖动完成验证'),
+        })
+        worker = asyncio.create_task(apply_input())
         while True:
             data = await websocket.receive_json()
-            msg_type = data.get('type')
-            
-            if msg_type == 'mouse_event':
-                # 处理鼠标事件
-                event_type = data.get('event_type')
-                x = data.get('x')
-                y = data.get('y')
-                
-                success = await captcha_controller.handle_mouse_event(
-                    session_id, event_type, x, y
-                )
-                
-                if success:
-                    # 只在鼠标释放后才检查完成状态
-                    if event_type == 'up':
-                        # 等待页面更新（给验证码一些反应时间）
-                        await asyncio.sleep(1.0)
-                        
-                        # 多次确认滑块确实消失
-                        completed = await captcha_controller.check_completion(session_id)
-                        
-                        if completed:
-                            # 再次确认（避免误判）
-                            await asyncio.sleep(0.5)
-                            completed = await captcha_controller.check_completion(session_id)
-                        
-                        if completed:
-                            await websocket.send_json({
-                                'type': 'completed',
-                                'message': '验证成功！'
-                            })
-                            logger.success(f"✅ 验证完成: {session_id}")
-                            break
-                        else:
-                            # 更新截图显示验证结果
-                            screenshot = await captcha_controller.update_screenshot(session_id)
-                            if screenshot:
-                                await websocket.send_json({
-                                    'type': 'screenshot_update',
-                                    'screenshot': screenshot
-                                })
-                    else:
-                        # 按下或移动时，实时更新截图（截取整个验证码容器）
-                        if event_type in ['down', 'move']:
-                            # 截取整个验证码容器，降低质量换取速度
-                            screenshot = await captcha_controller.update_screenshot(session_id, quality=30)
-                            if screenshot:
-                                await websocket.send_json({
-                                    'type': 'screenshot_update',
-                                    'screenshot': screenshot
-                                })
-            
-            elif msg_type == 'check_completion':
-                # 手动检查完成状态
-                completed = await captcha_controller.check_completion(session_id)
-                await websocket.send_json({
-                    'type': 'completion_status',
-                    'completed': completed
+            if data.get('type') == 'mouse_event':
+                if session.get('phase', 'ready') != 'ready':
+                    continue
+                event = MouseEvent(session_id=session_id, **{
+                    key: data[key] for key in ('event_type', 'x', 'y')
                 })
-                
-                if completed:
-                    break
-            
-            elif msg_type == 'ping':
-                # 心跳
+                if event.event_type not in ('down', 'move', 'up'):
+                    continue
+                item = {'event_type': event.event_type, 'x': event.x, 'y': event.y}
+                # Only replace adjacent moves: never drop or reorder down/up boundaries.
+                if pending and event.event_type == 'move' and pending[-1]['event_type'] == 'move':
+                    pending[-1] = item
+                else:
+                    if len(pending) >= 128:
+                        raise ValueError('鼠标事件队列溢出，请重新开启验证')
+                    pending.append(item)
+                ready.set()
+            elif data.get('type') == 'cancel':
+                session['cancelled'] = True
+                session['released'].set()
+            elif data.get('type') == 'ping':
                 await websocket.send_json({'type': 'pong'})
-    
     except WebSocketDisconnect:
-        logger.info(f"🔌 WebSocket 连接断开: {session_id}")
-    
-    except Exception as e:
-        logger.error(f"❌ WebSocket 错误: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-    
+        pass
+    except Exception as exc:
+        logger.warning(f"远程验证通道失败: {session_id}, {type(exc).__name__}")
     finally:
-        # 清理
-        if session_id in captcha_controller.websocket_connections:
+        if worker:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+        if captcha_controller.websocket_connections.get(session_id) is websocket:
             del captcha_controller.websocket_connections[session_id]
-        
-        logger.info(f"🔒 WebSocket 会话结束: {session_id}")
+            session = captcha_controller.active_sessions.get(session_id)
+            if session:
+                try:
+                    await session['page'].mouse.up()
+                except Exception:
+                    pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -234,7 +187,7 @@ async def handle_mouse_event(event: MouseEvent):
         raise HTTPException(status_code=400, detail="处理失败")
     
     # 检查是否完成
-    completed = await captcha_controller.check_completion(event.session_id)
+    completed = captcha_controller.is_completed(event.session_id)
     
     return {
         'success': True,
@@ -245,7 +198,7 @@ async def handle_mouse_event(event: MouseEvent):
 @router.post("/check_completion")
 async def check_completion(request: SessionCheckRequest):
     """检查验证是否完成"""
-    completed = await captcha_controller.check_completion(request.session_id)
+    completed = captcha_controller.is_completed(request.session_id)
     
     return {
         'session_id': request.session_id,

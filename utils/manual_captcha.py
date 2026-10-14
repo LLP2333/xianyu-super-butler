@@ -1,16 +1,4 @@
-"""人工完成滑块验证。
-
-实测发现自动识别已经能把滑块拖到目标位置（误差 0.3px 以内），但服务端仍
-判定失败 —— 拦的是行为特征而不是位置精度，因此继续加大自动重试不会有结果。
-
-项目里本来就有远程控制通道（``utils.captcha_remote_control`` 负责推屏和
-转发鼠标事件，``static/captcha_control.html`` 是操作页面），但一直没有代码
-调用它。这个模块把它接起来：打开登录页，等人在浏览器里完成验证，然后取回
-新的 Cookie。
-
-与 ``utils.xianyu_slider_stealth`` 的区别是那边用同步 Playwright，无法和
-异步的远程通道共享 page 对象，所以这里独立起一个异步浏览器。
-"""
+"""人工验证会话：持有服务器浏览器，回收 Cookie，并以 Token 确认结果。"""
 
 import asyncio
 import time
@@ -20,8 +8,6 @@ from loguru import logger
 from utils import browser_limit
 from utils.user_agents import CHROME_UA
 
-LOGIN_URL = "https://www.goofish.com/"
-
 # 人工操作需要时间，但也不能无限占用浏览器
 DEFAULT_TIMEOUT = 300
 
@@ -30,115 +16,106 @@ DEFAULT_TIMEOUT = 300
 CAPTCHA_PRESENT_TIMEOUT = 20
 
 
-def get_verification_url(cookie_id: str) -> Optional[str]:
-    """从风控日志里取该账号最近一次滑块惩罚的 URL。
-
-    惩罚 URL（``...punish?x5secdata=...&x5step=2&action=captcha``）是 Token
-    刷新响应里 ``data.url`` 返回的，写进了 ``risk_control_logs.event_description``。
-    只有导航到这个 URL 才会真正弹出滑块 —— 导航首页（原实现的 LOGIN_URL）不会。
-
-    x5secdata 有有效期（约 1 小时），过期后导航会跳到空白页。所以这里只是
-    兜底：会话内若触发实时 Token 刷新拿到新 URL 更好，拿不到才用它。
-    """
-    import re
-    from app.db_manager import db_manager
-
-    try:
-        with db_manager.lock:
-            cur = db_manager.conn.cursor()
-            cur.execute(
-                "SELECT event_description FROM risk_control_logs "
-                "WHERE cookie_id=? AND event_type='slider_captcha' "
-                "ORDER BY id DESC LIMIT 1",
-                (cookie_id,),
-            )
-            row = cur.fetchone()
-    except Exception as exc:
-        logger.debug(f"【{cookie_id}】读取惩罚 URL 失败: {exc}")
-        return None
-
-    if not row or not row[0]:
-        return None
-    m = re.search(r"URL: (\S+)", row[0])
-    url = m.group(1) if m else None
-    if url and ("punish" in url or "action=captcha" in url):
-        logger.info(f"【{cookie_id}】从风控日志取到惩罚 URL")
-        return url
-    return None
+class ManualVerificationError(Exception):
+    def __init__(self, stage: str, message: str):
+        super().__init__(message)
+        self.stage = stage
 
 
-async def _fetch_live_verification_url(cookie_id: str, cookies_str: str) -> Optional[str]:
-    """主动触发一次 Token 刷新，从响应里拿新鲜的惩罚 URL。
-
-    账号处于风控时，``mtop.taobao.idlemessage.pc.login.token`` 接口会在
-    ``data.url`` 返回滑块惩罚页地址；账号正常时返回 accessToken，没有该字段。
-
-    这里只读 URL、**不调用** XianyuLive 的自动解滑块流程（那条路径实测失败），
-    避免在人工处理前又被自动重试一遍。
-    """
+async def request_manual_token(cookies_str: str, *, retry_cookie_rotation: bool = True) -> Dict[str, Any]:
+    """Single Token request, without automatic solving or account mutations."""
     import json
-    import time
     import aiohttp
     from app.config import API_ENDPOINTS
     from utils.xianyu_utils import trans_cookies, generate_sign, generate_device_id
 
+    cd = trans_cookies(cookies_str)
+    token = cd.get('_m_h5_tk', '').split('_')[0]
+    if not token:
+        raise ManualVerificationError('token_confirm', '账号缺少签名 Cookie，请重新扫码登录')
+
+    ts = str(int(time.time() * 1000))
+    params = {
+        "jsv": "2.7.2", "appKey": "34839810", "t": ts, "sign": "", "v": "1.0",
+        "type": "originaljson", "accountSite": "xianyu", "dataType": "json",
+        "timeout": "20000", "api": "mtop.taobao.idlemessage.pc.login.token",
+        "sessionOption": "AutoLoginOnly",
+        "dangerouslySetWindvaneParams": "%5Bobject%20Object%5D",
+        "smToken": "token", "queryToken": "sm", "sm": "sm",
+        "spm_cnt": "a21ybx.im.0.0", "spm_pre": "a21ybx.home.sidebar.1.4c053da6vYwnmf",
+        "log_id": "4c053da6vYwnmf",
+    }
+    device_id = generate_device_id(cd.get("unb", ""))
+    data_val = json.dumps(
+        {"appKey": "444e9908a51d1cb236a27862abc769c9", "deviceId": device_id}
+    )
+    params["sign"] = generate_sign(params["t"], token, data_val)
+
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/x-www-form-urlencoded",
+        "user-agent": CHROME_UA,
+        "referer": "https://www.goofish.com/",
+        "origin": "https://www.goofish.com",
+        "cookie": cookies_str,
+    }
+
     try:
-        cd = trans_cookies(cookies_str)
-        if "_m_h5_tk" not in cd:
-            return None
-        token = cd["_m_h5_tk"].split("_")[0]
-        if not token:
-            return None
-
-        ts = str(int(time.time() * 1000))
-        params = {
-            "jsv": "2.7.2", "appKey": "34839810", "t": ts, "sign": "", "v": "1.0",
-            "type": "originaljson", "accountSite": "xianyu", "dataType": "json",
-            "timeout": "20000", "api": "mtop.taobao.idlemessage.pc.login.token",
-            "sessionOption": "AutoLoginOnly",
-            "dangerouslySetWindvaneParams": "%5Bobject%20Object%5D",
-            "smToken": "token", "queryToken": "sm", "sm": "sm",
-            "spm_cnt": "a21ybx.im.0.0", "spm_pre": "a21ybx.home.sidebar.1.4c053da6vYwnmf",
-            "log_id": "4c053da6vYwnmf",
-        }
-        device_id = generate_device_id(cd.get("unb", ""))
-        data_val = json.dumps(
-            {"appKey": "444e9908a51d1cb236a27862abc769c9", "deviceId": device_id}
-        )
-        params["sign"] = generate_sign(params["t"], token, data_val)
-
-        headers = {
-            "accept": "application/json",
-            "content-type": "application/x-www-form-urlencoded",
-            "user-agent": CHROME_UA,
-            "referer": "https://www.goofish.com/",
-            "origin": "https://www.goofish.com",
-            "cookie": cookies_str,
-        }
-
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                API_ENDPOINTS.get("token"),
-                params=params,
-                data={"data": data_val},
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as resp:
-                text = await resp.text()
-                payload = json.loads(text)
-                ret = payload.get("ret", [])
-                if any("SUCCESS" in str(r) for r in ret):
-                    # 成功返回 accessToken —— 账号当前不在风控，无惩罚页
-                    return None
-                data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-                url = data.get("url")
-                if url and ("punish" in url or "action=captcha" in url):
-                    logger.info(f"【{cookie_id}】实时刷新拿到惩罚 URL")
-                    return url
-        return None
+                API_ENDPOINTS.get('token'), params=params, data={'data': data_val},
+                headers=headers, timeout=aiohttp.ClientTimeout(total=30),
+            ) as response:
+                if response.status != 200:
+                    raise ManualVerificationError('token_confirm', f'Token 接口 HTTP {response.status}')
+                payload = await response.json(content_type=None)
+                # Preserve cookie rotations issued by the Token response.
+                for name, morsel in response.cookies.items():
+                    if morsel['max-age'] == '0':
+                        cd.pop(name, None)
+                    else:
+                        cd[name] = morsel.value
+    except ManualVerificationError:
+        raise
     except Exception as exc:
-        logger.debug(f"【{cookie_id}】实时获取惩罚 URL 失败: {exc}")
-        return None
+        raise ManualVerificationError('token_confirm', f'Token 请求失败（{type(exc).__name__}）') from exc
+    if not isinstance(payload, dict):
+        raise ManualVerificationError('token_confirm', 'Token 接口响应格式错误')
+    data = payload.get('data') if isinstance(payload.get('data'), dict) else {}
+    # Only retain result codes, never log tokens, cookies or challenge URLs.
+    ret = payload.get('ret') or []
+    if isinstance(ret, str):
+        ret = [ret]
+    codes = ', '.join(str(value).split('::')[0][:80] for value in ret)[:240]
+    updated_cookies = '; '.join(f'{key}={value}' for key, value in cd.items())
+    if (retry_cookie_rotation and not data.get('accessToken')
+            and any(code in codes for code in ('FAIL_SYS_TOKEN_EXOIRED', 'FAIL_SYS_TOKEN_EXPIRED'))
+            and cd.get('_m_h5_tk', '').split('_')[0] != token):
+        return await request_manual_token(updated_cookies, retry_cookie_rotation=False)
+    return {
+        'token': data.get('accessToken'),
+        'url': data.get('url') or '',
+        'cookies_str': updated_cookies,
+        'reason': codes or '接口未返回 accessToken',
+    }
+
+
+async def collect_verification_cookies(context, session_id: str, previous: str) -> str:
+    """Wait briefly for the user's challenge response, without issuing Token retries."""
+    from app.config import API_ENDPOINTS
+    from utils.xianyu_utils import trans_cookies
+    from utils.captcha_remote_control import captcha_controller
+
+    previous_pass = trans_cookies(previous).get('x5sec')
+    deadline = time.monotonic() + 5
+    while True:
+        await asyncio.sleep(0.25)
+        cookies = _from_playwright_cookies(await context.cookies([API_ENDPOINTS['token']]))
+        current_pass = trans_cookies(cookies).get('x5sec') if cookies else None
+        if ((current_pass and current_pass != previous_pass)
+                or await captcha_controller.check_completion(session_id)
+                or time.monotonic() >= deadline):
+            return cookies
 
 
 async def open_manual_session(
@@ -146,6 +123,7 @@ async def open_manual_session(
     cookies_str: str,
     timeout: int = DEFAULT_TIMEOUT,
     headless: bool = True,
+    session_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """打开一个人工验证会话，等待人在浏览器里完成滑块。
 
@@ -161,7 +139,7 @@ async def open_manual_session(
 
     from utils.captcha_remote_control import captcha_controller
 
-    session_id = str(cookie_id)
+    session_id = session_id or str(cookie_id)
     result: Dict[str, Any] = {
         "success": False,
         "cookies_str": cookies_str,
@@ -173,6 +151,7 @@ async def open_manual_session(
     browser = None
     context = None
     refresh_task = None
+    stage = "browser_start"
     try:
         playwright = await async_playwright().start()
         browser = await browser_limit.launch_browser(
@@ -200,29 +179,27 @@ async def open_manual_session(
 
         page = await context.new_page()
 
-        # 惩罚页 URL 优先：只有导航到它才会弹出滑块。
-        # 原实现导航到闲鱼首页，首页没有滑块 → check_completion 立刻误判
-        # “已完成” → 浏览器秒关，用户连上控制页时会话已不存在。
-        #
-        # 先触发一次实时 Token 刷新拿最新 URL（账号正在风控才返回）；拿不到
-        # 再退回 DB 里最近一次惩罚 URL（可能已过期，等滑块时会发现）。
-        verification_url = await _fetch_live_verification_url(cookie_id, cookies_str)
-        if not verification_url:
-            verification_url = get_verification_url(cookie_id)
-        if not verification_url:
-            result["message"] = "未找到该账号的滑块惩罚 URL，无法开启人工验证"
-            logger.warning(f"【{cookie_id}】{result['message']}")
+        stage = 'challenge_fetch'
+        initial = await request_manual_token(cookies_str)
+        if initial['token']:
+            result.update(success=True, cookies_str=initial['cookies_str'],
+                          token=initial['token'], message='Token 确认成功，账号已可恢复')
             return result
-
+        verification_url = initial['url']
+        if not verification_url or not ('punish' in verification_url or 'action=captcha' in verification_url):
+            raise ManualVerificationError(stage, f"未取得滑块验证链接：{initial['reason']}")
+        await context.add_cookies(_to_playwright_cookies(initial['cookies_str']))
+        stage = 'page_load'
         try:
             await page.goto(verification_url, wait_until="domcontentloaded", timeout=60000)
         except Exception as exc:
-            logger.warning(f"【{cookie_id}】导航惩罚页失败: {exc}")
+            raise ManualVerificationError(stage, f"验证页面加载失败（{type(exc).__name__}）") from exc
         # 给验证组件一点渲染时间，否则截图可能是空白
         await asyncio.sleep(2)
 
         # 等滑块真正出现再建会话 —— 找不到滑块说明 x5secdata 已失效，
         # 此时即使建了会话也拖不出结果，尽早告知用户更合适。
+        stage = 'captcha_detect'
         captcha_appeared = await _wait_for_captcha_present(page, timeout=CAPTCHA_PRESENT_TIMEOUT)
         if not captcha_appeared:
             result["message"] = (
@@ -230,55 +207,78 @@ async def open_manual_session(
                 "请让账号重新触发风控后重试"
             )
             logger.warning(f"【{cookie_id}】{result['message']}")
-            return result
+            raise ManualVerificationError(stage, result['message'])
 
         await captcha_controller.create_session(session_id, page)
         # 持续推送截图，让用户能看到自己的拖动效果
         refresh_task = asyncio.create_task(
-            captcha_controller.auto_refresh_screenshot(session_id, interval=1.0)
+            captcha_controller.auto_refresh_screenshot(session_id, interval=0.1)
         )
 
         logger.warning(
             f"【{cookie_id}】已开启人工验证会话，请在 {timeout} 秒内于"
-            f" /static/captcha_control.html?session={session_id} 完成验证"
+            f"账号管理页的人工验证弹窗完成操作"
         )
 
-        # 关键：会话期间浏览器必须保持存活，等用户拖完才返回。
-        # 原实现在这里死等 timeout，且 check_completion 在无滑块时误判完成
-        # 直接秒关 —— 改为“滑块出现后，持续等待它消失（完成）或超时”。
         deadline = time.monotonic() + timeout
-        completed = False
-        while time.monotonic() < deadline:
-            await asyncio.sleep(2)
+        released = captcha_controller.active_sessions[session_id]['released']
+        last_reason = '等待人工操作'
+        previous_cookies = initial['cookies_str']
+        while True:
+            stage = 'human_input'
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ManualVerificationError(stage, f'人工验证超时：{last_reason}')
             try:
-                if await captcha_controller.check_completion(session_id):
-                    completed = True
-                    break
-            except Exception as exc:
-                logger.debug(f"【{cookie_id}】检查验证完成状态失败: {exc}")
-
-        if not completed:
-            result["message"] = f"人工验证超时（{timeout} 秒内未完成）"
-            logger.warning(f"【{cookie_id}】{result['message']}")
-            return result
-
-        new_cookies = _from_playwright_cookies(await context.cookies())
-        if not new_cookies:
-            result["message"] = "验证已完成但未取到 Cookie"
-            return result
-
-        result["success"] = True
-        result["cookies_str"] = new_cookies
-        result["message"] = "人工验证完成"
-        logger.info(f"【{cookie_id}】人工验证完成，已取得新 Cookie")
-        return result
+                await asyncio.wait_for(released.wait(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                raise ManualVerificationError(stage, f'人工验证超时：{last_reason}') from exc
+            released.clear()
+            if captcha_controller.active_sessions[session_id].get('cancelled'):
+                raise ManualVerificationError('cancelled', '用户已取消人工验证')
+            captcha_controller.active_sessions[session_id].update(phase='verifying', message='正在回收 Cookie 并确认 Token…')
+            ws = captcha_controller.websocket_connections.get(session_id)
+            if ws:
+                try:
+                    await ws.send_json({'type': 'verifying', 'message': '正在回收 Cookie 并确认 Token…'})
+                except Exception:
+                    pass
+            stage = 'cookie_collect'
+            new_cookies = await collect_verification_cookies(context, session_id, previous_cookies)
+            if not new_cookies:
+                raise ManualVerificationError(stage, '人工操作后未读取到 Cookie')
+            from utils.xianyu_utils import drop_stale_captcha_challenge
+            new_cookies = drop_stale_captcha_challenge(new_cookies)
+            previous_cookies = new_cookies
+            stage = 'token_confirm'
+            confirmed = await request_manual_token(new_cookies)
+            if confirmed['token']:
+                captcha_controller.active_sessions[session_id]['completed'] = True
+                result.update(success=True, cookies_str=confirmed['cookies_str'],
+                              token=confirmed['token'], message='人工验证成功，Token 已确认')
+                return result
+            if confirmed.get('cookies_str'):
+                await context.add_cookies(_to_playwright_cookies(confirmed['cookies_str']))
+            last_reason = f"[token_confirm] Token 确认失败：{confirmed['reason']}"
+            captcha_controller.active_sessions[session_id].update(phase='ready', message=f'{last_reason}，账号尚未恢复，可继续操作')
+            logger.warning(f"【{cookie_id}】{last_reason}")
+            # A rejected gesture does not destroy the browser or start a new challenge.
+            # Keep the same session for the user's next attempt; never auto-retry Token.
+            if ws:
+                try:
+                    await ws.send_json({'type': 'retry', 'message': f'{last_reason}，账号尚未恢复，可继续操作'})
+                except Exception:
+                    pass
     except Exception as exc:
-        result["message"] = f"人工验证会话异常: {exc}"
-        logger.error(f"【{cookie_id}】{result['message']}")
+        failure_stage = exc.stage if isinstance(exc, ManualVerificationError) else stage
+        message = str(exc) if isinstance(exc, ManualVerificationError) else f'处理异常（{type(exc).__name__}）'
+        result.update(stage=failure_stage, message=f'[{failure_stage}] {message}')
+        logger.warning(f"【{cookie_id}】人工验证失败：{result['message']}")
         return result
     finally:
         if refresh_task and not refresh_task.done():
             refresh_task.cancel()
+            await asyncio.gather(refresh_task, return_exceptions=True)
         try:
             from utils.captcha_remote_control import captcha_controller
 
@@ -351,10 +351,10 @@ def _to_playwright_cookies(cookies_str: str) -> list:
 
 def _from_playwright_cookies(cookies: list) -> str:
     """把 Playwright 的 Cookie 列表拼回字符串。"""
-    pairs = []
-    for cookie in cookies or []:
-        name = cookie.get("name")
-        if not name:
-            continue
-        pairs.append(f"{name}={cookie.get('value', '')}")
-    return "; ".join(pairs)
+    pairs = {}
+    # A host/path-specific cookie overrides a parent-domain cookie of the same name.
+    for cookie in sorted(cookies or [], key=lambda c: (len(c.get('path', '/')), len(c.get('domain', '')))):
+        name = cookie.get('name')
+        if name:
+            pairs[name] = cookie.get('value', '')
+    return '; '.join(f'{name}={value}' for name, value in pairs.items())

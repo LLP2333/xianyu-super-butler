@@ -9341,93 +9341,97 @@ def use_quick_phrase(
     return {'success': db_manager.increment_quick_phrase_usage(phrase_id)}
 
 
+_manual_captcha_accounts = set()
+
+
 @app.post('/api/captcha/manual-session')
 async def start_manual_captcha(
     cookie_id: str = Form(...),
+    session_id: str = Form(...),
     timeout: int = Form(300),
     current_user: Dict[str, Any] = Depends(get_current_user)
 ):
-    """开启人工验证会话。
-
-    自动识别虽然能把滑块拖到目标位置，但服务端拦的是行为特征，重试再多次也
-    不会通过。这里把滑块画面推到前端弹窗，用户手动完成后取回新 Cookie。
-
-    只有账号处于风控状态时才允许调用 —— 非风控时闲鱼不会下发惩罚页，
-    开会话只会白等一场，还可能因为多余请求把账号推向风控。
-    """
-    from app.db_manager import db_manager
+    """Recover an account only after its collected cookies obtain a Token."""
     from utils.manual_captcha import open_manual_session
     from utils import risk_control
-
-    user_cookies = db_manager.get_all_cookies(current_user['user_id'])
-    if cookie_id not in user_cookies:
-        raise HTTPException(status_code=404, detail="账号不存在或无权访问")
-
-    guard = risk_control.registry.get(cookie_id)
-    if not guard.is_blocked:
-        raise HTTPException(
-            status_code=409,
-            detail="该账号当前不处于风控状态，无需人工验证",
-        )
-
-    # 暂停该账号的自动 Token 刷新/滑块循环。自动滑块和人工验证共用
-    # browser_limit 全局信号量（默认 3 槽位），自动滑块占满槽位后人工验证
-    # 会在 launch_browser 里等 300 秒超时，前端弹窗就卡在白屏 loading。
-    _instance = None
-    if cookie_manager.manager is not None:
-        _instance = cookie_manager.manager.instances.get(cookie_id)
-        if _instance is not None:
-            _instance.manual_captcha_in_progress = True
-            log_with_user('info', f"账号 {cookie_id} 已暂停自动验证，等待人工完成", current_user)
+    from uuid import UUID
 
     try:
+        session_id = str(UUID(session_id))
+    except ValueError:
+        raise HTTPException(status_code=400, detail='验证会话编号无效')
+    user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+    if cookie_id not in user_cookies:
+        raise HTTPException(status_code=404, detail='账号不存在或无权访问')
+    if cookie_id in _manual_captcha_accounts:
+        raise HTTPException(status_code=409, detail='该账号已有人工验证会话，请完成或等待其结束')
+    _manual_captcha_accounts.add(cookie_id)
+    manager = cookie_manager.manager
+    result = {'success': False, 'session_id': session_id, 'stage': 'account_pause', 'message': ''}
+    saved = False
+    try:
+        # Stop in-flight automatic refresh as well as future retries before taking ownership.
+        if manager:
+            instance = manager.instances.get(cookie_id)
+            if instance:
+                instance.manual_captcha_in_progress = True
+            task = manager.tasks.get(cookie_id)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=15)
+                except asyncio.CancelledError:
+                    pass
+        # Automatic refresh may have rotated cookies while its task was stopping.
+        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
+        if cookie_id not in user_cookies:
+            raise RuntimeError('账号已被删除')
         timeout = max(60, min(int(timeout or 300), 900))
-        result = await open_manual_session(
-            cookie_id, user_cookies[cookie_id], timeout=timeout
-        )
-    finally:
-        if _instance is not None:
-            _instance.manual_captcha_in_progress = False
-
-    if result['success']:
-        # 拿到 x5sec 后必须清掉 x5secdata 等挑战标记，否则闲鱼会认为验证仍未完成，
-        # 继续返回 FAIL_SYS_USER_VALIDATE —— 表现为"滑块过了但账号还是用不了"
-        from utils.xianyu_utils import drop_stale_captcha_challenge
-        cleaned_cookies = drop_stale_captcha_challenge(result['cookies_str'])
-        if cleaned_cookies != result['cookies_str']:
-            log_with_user('info', f"账号 {cookie_id} 已清除过期的验证挑战标记", current_user)
-        result['cookies_str'] = cleaned_cookies
-
-        # 保存新 Cookie 并解除风控熔断，让账号能立刻重连
-        db_manager.save_cookie(cookie_id, result['cookies_str'])
-
-        # 运行中的实例仍持有旧 Cookie，不同步会继续用旧值打接口并立刻再次熔断
-        try:
-            manager = cookie_manager.manager
-            if manager is not None:
-                manager.cookies[cookie_id] = result['cookies_str']
-                instance = manager.instances.get(cookie_id)
-                if instance is not None:
-                    instance.cookies_str = result['cookies_str']
-                    # 清掉失效令牌，强制下次请求重新获取
-                    instance.current_token = None
-                    log_with_user('info', f"账号 {cookie_id} 运行实例已同步新 Cookie", current_user)
-        except Exception as exc:
-            log_with_user('warning', f"同步实例 Cookie 失败: {exc}", current_user)
-
-        try:
-            from utils import risk_control
-
+        result['stage'] = 'manual_session'
+        result = await asyncio.wait_for(open_manual_session(
+            cookie_id, user_cookies[cookie_id], timeout=timeout, session_id=session_id
+        ), timeout=timeout + 120)
+        if result['success']:
+            result['stage'] = 'cookie_save'
+            if not db_manager.update_cookie_account_info(cookie_id, cookie_value=result['cookies_str']):
+                raise RuntimeError('Cookie 保存失败')
+            saved = True
             risk_control.registry.get(cookie_id).reset()
-        except Exception as exc:
-            log_with_user('warning', f"重置风控状态失败: {exc}", current_user)
-        log_with_user('info', f"账号 {cookie_id} 人工验证完成，已更新 Cookie", current_user)
-
-    return JSONResponse({
-        'success': result['success'],
-        'message': result['message'],
-        'session_id': result['session_id'],
-    })
+        else:
+            risk_control.registry.get(cookie_id).trip(result['message'])
+        result['stage'] = 'account_resume' if result['success'] else result.get('stage', 'unknown')
+        if manager:
+            await manager.update_cookie(
+                cookie_id, result['cookies_str'] if saved else user_cookies[cookie_id], save_to_db=False
+            )
+        if result['success']:
+            result['message'] = '人工验证成功，Cookie 已保存、Token 已确认'
+            if manager and manager.cookie_status.get(cookie_id, True):
+                result['message'] += '，账号任务已重启'
+            else:
+                result['message'] += '，启用账号后即可连接'
+    except Exception as exc:
+        result.update(success=False, message=f"[{result['stage']}] 恢复失败（{type(exc).__name__}）")
+        risk_control.registry.get(cookie_id).trip(result['message'])
+        # Never leave the account permanently stopped after a failed browser/session startup.
+        if manager and result['stage'] != 'account_resume':
+            try:
+                await manager.update_cookie(cookie_id, result.get('cookies_str') if saved else user_cookies[cookie_id], save_to_db=False)
+            except Exception:
+                result['message'] += '；账号任务恢复失败，请重新启用账号'
+    finally:
+        _manual_captcha_accounts.discard(cookie_id)
+        instance = manager.instances.get(cookie_id) if manager else None
+        if instance:
+            instance.manual_captcha_in_progress = False
+    db_manager.add_risk_control_log(
+        cookie_id=cookie_id, event_type='slider_captcha',
+        event_description='人工滑块验证与 Token 恢复确认',
+        processing_result=result['message'],
+        processing_status='success' if result['success'] else 'failed',
+        error_message=None if result['success'] else result['message'],
+    )
+    return JSONResponse({key: result.get(key, '') for key in ('success', 'message', 'session_id', 'stage')})
 
 
 def classify_verification_event(detail: str, blocked: bool = False, reason: str = '') -> Tuple[str, str]:
@@ -9446,104 +9450,6 @@ def classify_verification_event(detail: str, blocked: bool = False, reason: str 
     if blocked:
         return 'risk_control', reason or '闲鱼限制了当前账号请求'
     return 'none', ''
-
-
-@app.post('/api/risk-control/{cookie_id}/fresh-captcha-url')
-async def get_fresh_captcha_url(
-    cookie_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-):
-    """实时取一个新鲜的滑块验证链接。
-
-    punish 链接里的 x5secdata 只能用一次、且约 1 小时后失效，过期后打开只会看到
-    「抱歉，页面访问出现了问题」。风控日志里存的是历史链接，直接拿来用基本都是死链，
-    所以这里凭账号 Cookie 重新请求一次 Token 接口 —— 仍被风控就拿到新链接，
-    风控已解除则直接返回可用状态，让用户不必白跑一趟验证。
-    """
-    user_cookies = db_manager.get_all_cookies(current_user['user_id'])
-    if cookie_id not in user_cookies:
-        raise HTTPException(status_code=403, detail='无权限操作该账号')
-
-    import aiohttp
-    from app.config import API_ENDPOINTS
-    from utils.xianyu_utils import trans_cookies, generate_sign, generate_device_id
-
-    cookies_str = user_cookies[cookie_id]
-    try:
-        cookie_dict = trans_cookies(cookies_str)
-    except ValueError:
-        raise HTTPException(status_code=400, detail='账号 Cookie 为空，请重新扫码登录')
-
-    token = (cookie_dict.get('_m_h5_tk') or '').split('_')[0]
-    if not token:
-        raise HTTPException(
-            status_code=409,
-            detail='账号 Cookie 缺少 _m_h5_tk 字段，请重新扫码登录',
-        )
-
-    timestamp = str(int(time.time() * 1000))
-    device_id = generate_device_id(cookie_dict.get('unb', ''))
-    data_value = (
-        '{"appKey":"444e9908a51d1cb236a27862abc769c9","deviceId":"' + device_id + '"}'
-    )
-    params = {
-        'jsv': '2.7.2', 'appKey': '34839810', 't': timestamp,
-        'sign': generate_sign(timestamp, token, data_value),
-        'v': '1.0', 'type': 'originaljson', 'accountSite': 'xianyu',
-        'dataType': 'json', 'timeout': '20000',
-        'api': 'mtop.taobao.idlemessage.pc.login.token',
-        'sessionOption': 'AutoLoginOnly',
-        'dangerouslySetWindvaneParams': '%5Bobject%20Object%5D',
-        'smToken': 'token', 'queryToken': 'sm', 'sm': 'sm',
-        'spm_cnt': 'a21ybx.im.0.0',
-        'spm_pre': 'a21ybx.home.sidebar.1.4c053da6vYwnmf',
-        'log_id': '4c053da6vYwnmf',
-    }
-    headers = {
-        'accept': 'application/json',
-        'content-type': 'application/x-www-form-urlencoded',
-        'user-agent': CHROME_UA,
-        'referer': 'https://www.goofish.com/',
-        'origin': 'https://www.goofish.com',
-        'cookie': cookies_str,
-    }
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                API_ENDPOINTS.get('token'),
-                params=params, data={'data': data_value}, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=25),
-            ) as response:
-                payload = await response.json(content_type=None)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f'请求闲鱼接口失败: {exc}') from exc
-
-    data = payload.get('data') if isinstance(payload, dict) else None
-    data = data if isinstance(data, dict) else {}
-
-    if data.get('accessToken'):
-        log_with_user('info', f'账号 {cookie_id} 风控已解除，无需验证', current_user)
-        return {
-            'success': True,
-            'need_verify': False,
-            'message': '该账号风控已解除，无需再做验证',
-        }
-
-    url = data.get('url') or ''
-    if url and ('punish' in url or 'action=captcha' in url):
-        log_with_user('info', f'账号 {cookie_id} 已取得新的验证链接', current_user)
-        return {
-            'success': True,
-            'need_verify': True,
-            'verification_url': url,
-            'message': '已取得新的验证链接，请在浏览器中完成滑块',
-        }
-
-    raise HTTPException(
-        status_code=502,
-        detail=f"闲鱼未返回验证链接: {payload.get('ret') if isinstance(payload, dict) else payload}",
-    )
 
 
 @app.get('/api/risk-control/status')
