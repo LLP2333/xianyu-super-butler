@@ -9355,6 +9355,9 @@ async def start_manual_captcha(
     from utils.manual_captcha import open_manual_session
     from utils import risk_control
     from uuid import UUID
+    from loguru import logger
+    from utils.log_sanitizer import redact_sensitive_text
+    import traceback
 
     try:
         session_id = str(UUID(session_id))
@@ -9369,19 +9372,12 @@ async def start_manual_captcha(
     manager = cookie_manager.manager
     result = {'success': False, 'session_id': session_id, 'stage': 'account_pause', 'message': ''}
     saved = False
+    paused = False
+    resume_attempted = False
     try:
-        # Stop in-flight automatic refresh as well as future retries before taking ownership.
         if manager:
-            instance = manager.instances.get(cookie_id)
-            if instance:
-                instance.manual_captcha_in_progress = True
-            task = manager.tasks.get(cookie_id)
-            if task and not task.done():
-                task.cancel()
-                try:
-                    await asyncio.wait_for(task, timeout=15)
-                except asyncio.CancelledError:
-                    pass
+            await manager.pause_cookie_task(cookie_id)
+            paused = True
         # Automatic refresh may have rotated cookies while its task was stopping.
         user_cookies = db_manager.get_all_cookies(current_user['user_id'])
         if cookie_id not in user_cookies:
@@ -9399,11 +9395,15 @@ async def start_manual_captcha(
             risk_control.registry.get(cookie_id).reset()
         else:
             risk_control.registry.get(cookie_id).trip(result['message'])
-        result['stage'] = 'account_resume' if result['success'] else result.get('stage', 'unknown')
         if manager:
-            await manager.update_cookie(
+            verification_stage = result.get('stage', 'manual_session')
+            result['stage'] = 'account_resume'
+            resume_attempted = True
+            await manager.update_cookie_async(
                 cookie_id, result['cookies_str'] if saved else user_cookies[cookie_id], save_to_db=False
             )
+            if not result['success']:
+                result['stage'] = verification_stage
         if result['success']:
             result['message'] = '人工验证成功，Cookie 已保存、Token 已确认'
             if manager and manager.cookie_status.get(cookie_id, True):
@@ -9411,19 +9411,19 @@ async def start_manual_captcha(
             else:
                 result['message'] += '，启用账号后即可连接'
     except Exception as exc:
-        result.update(success=False, message=f"[{result['stage']}] 恢复失败（{type(exc).__name__}）")
-        risk_control.registry.get(cookie_id).trip(result['message'])
-        # Never leave the account permanently stopped after a failed browser/session startup.
-        if manager and result['stage'] != 'account_resume':
+        detail = redact_sensitive_text(f'{type(exc).__name__}: {exc}')
+        result.update(success=False, message=f"[{result['stage']}] 恢复失败（{detail}）")
+        logger.error(f"【{cookie_id}】{result['message']}\n{redact_sensitive_text(traceback.format_exc())}")
+        # A local lifecycle failure is not evidence of a new platform risk-control hit.
+        if manager and paused and not resume_attempted:
             try:
-                await manager.update_cookie(cookie_id, result.get('cookies_str') if saved else user_cookies[cookie_id], save_to_db=False)
-            except Exception:
-                result['message'] += '；账号任务恢复失败，请重新启用账号'
+                await manager.update_cookie_async(cookie_id, result.get('cookies_str') if saved else user_cookies[cookie_id], save_to_db=False)
+            except Exception as resume_exc:
+                resume_detail = redact_sensitive_text(f'{type(resume_exc).__name__}: {resume_exc}')
+                result['message'] += f'；[account_resume] 账号任务恢复失败（{resume_detail}），请重新启用账号'
+                logger.error(f"【{cookie_id}】账号任务恢复失败\n{redact_sensitive_text(traceback.format_exc())}")
     finally:
         _manual_captcha_accounts.discard(cookie_id)
-        instance = manager.instances.get(cookie_id) if manager else None
-        if instance:
-            instance.manual_captcha_in_progress = False
     db_manager.add_risk_control_log(
         cookie_id=cookie_id, event_type='slider_captcha',
         event_description='人工滑块验证与 Token 恢复确认',

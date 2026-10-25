@@ -155,7 +155,7 @@ class RecoveryCommitTests(unittest.IsolatedAsyncioTestCase):
                 db = MagicMock()
                 db.get_all_cookies.return_value = {'account': 'old'}
                 db.update_cookie_account_info.return_value = True
-                manager = SimpleNamespace(instances={}, tasks={}, cookie_status={}, update_cookie=AsyncMock())
+                manager = SimpleNamespace(instances={}, tasks={}, cookie_status={}, pause_cookie_task=AsyncMock(), update_cookie_async=AsyncMock())
                 result = {'success': success, 'cookies_str': 'confirmed', 'session_id': str(uuid4()), 'stage': 'token_confirm', 'message': 'verified' if success else 'Token refused'}
                 with patch.object(manual_captcha, 'open_manual_session', AsyncMock(return_value=result)):
                     response = await self.endpoint(db, manager)('account', result['session_id'], 60, {'user_id': 1})
@@ -164,8 +164,117 @@ class RecoveryCommitTests(unittest.IsolatedAsyncioTestCase):
                     db.update_cookie_account_info.assert_called_once_with('account', cookie_value='confirmed')
                 else:
                     db.update_cookie_account_info.assert_not_called()
-                manager.update_cookie.assert_awaited_once_with('account', 'confirmed' if success else 'old', save_to_db=False)
+                manager.update_cookie_async.assert_awaited_once_with('account', 'confirmed' if success else 'old', save_to_db=False)
                 self.assertEqual(db.add_risk_control_log.call_args.kwargs['processing_status'], 'success' if success else 'failed')
+
+
+class CrossLoopRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        import threading
+        from app.cookie_manager import CookieManager
+        self.db_patch = patch('app.cookie_manager.db_manager')
+        self.db = self.db_patch.start()
+        self.db.get_all_cookies.return_value = {'account': 'old'}
+        self.db.get_all_keywords.return_value = {}
+        self.db.get_all_cookie_status.return_value = {'account': True}
+        self.db.get_cookie_details.return_value = {'user_id': 1}
+        self.db.update_cookie_account_info.return_value = True
+        self.owner = asyncio.new_event_loop()
+        self.owner.set_debug(True)
+        started = threading.Event()
+
+        def run():
+            asyncio.set_event_loop(self.owner)
+            self.owner.call_soon(started.set)
+            self.owner.run_forever()
+
+        self.thread = threading.Thread(target=run)
+        self.thread.start()
+        self.assertTrue(started.wait(2))
+        self.manager = CookieManager(self.owner)
+        self.worker_loops = []
+
+        async def worker(*args):
+            self.worker_loops.append(asyncio.get_running_loop())
+            try:
+                await asyncio.sleep(3600)
+            finally:
+                # Real cleanup requires more loop turns; the API loop must stay responsive.
+                await asyncio.sleep(0.05)
+
+        self.manager._run_xianyu = worker
+        await self.manager.update_cookie_async('account', 'old', save_to_db=False)
+
+    async def asyncTearDown(self):
+        async def cleanup():
+            tasks = list(asyncio.all_tasks())
+            tasks.remove(asyncio.current_task())
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(cleanup(), self.owner))
+        self.owner.call_soon_threadsafe(self.owner.stop)
+        self.thread.join(2)
+        self.assertFalse(self.thread.is_alive())
+        self.owner.close()
+        self.db_patch.stop()
+
+    async def run_recovery(self, success):
+        api_loop = asyncio.get_running_loop()
+        original = self.manager.tasks['account']
+        ticks = []
+        done = asyncio.Event()
+
+        async def heartbeat():
+            while not done.is_set():
+                ticks.append(1)
+                await asyncio.sleep(0.005)
+
+        async def manual(*args, **kwargs):
+            self.assertIs(asyncio.get_running_loop(), api_loop)
+            self.assertTrue(original.done())
+            return {'success': success, 'cookies_str': 'new' if success else 'old',
+                    'message': 'Token confirmed' if success else 'Token refused',
+                    'stage': 'token_confirm', 'session_id': kwargs['session_id']}
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+        try:
+            endpoint = RecoveryCommitTests().endpoint(self.db, self.manager)
+            with patch.object(manual_captcha, 'open_manual_session', side_effect=manual):
+                response = await endpoint('account', str(uuid4()), 60, {'user_id': 1})
+        finally:
+            done.set()
+            await heartbeat_task
+        self.assertEqual(json.loads(response.body)['success'], success)
+        self.assertTrue(original.done())
+        replacement = self.manager.tasks['account']
+        self.assertIsNot(replacement, original)
+        self.assertIs(replacement.get_loop(), self.owner)
+        self.assertFalse(replacement.done())
+        self.assertTrue(all(loop is self.owner for loop in self.worker_loops))
+        self.assertGreater(len(ticks), 2, 'API loop was blocked by synchronous Future.result()')
+        self.assertEqual(self.manager.cookies['account'], 'new' if success else 'old')
+        if not success:
+            self.db.update_cookie_account_info.assert_not_called()
+
+    async def test_two_loop_success_pauses_and_restarts_on_owner_loop(self):
+        await self.run_recovery(True)
+
+    async def test_two_loop_token_failure_restores_original_account(self):
+        await self.run_recovery(False)
+
+    async def test_pause_error_keeps_diagnostic_details_without_leaking_token(self):
+        from utils import risk_control
+        endpoint = RecoveryCommitTests().endpoint(self.db, self.manager)
+        with patch.object(self.manager, 'pause_cookie_task', AsyncMock(side_effect=ValueError('different loop; token=secret-value'))), patch.object(self.manager, 'update_cookie_async', AsyncMock()) as resume, patch.object(risk_control.registry.get('account'), 'trip') as trip:
+            response = await endpoint('account', str(uuid4()), 60, {'user_id': 1})
+        body = json.loads(response.body)
+        self.assertFalse(body['success'])
+        self.assertIn('ValueError: different loop', body['message'])
+        self.assertNotIn('secret-value', body['message'])
+        resume.assert_not_awaited()
+        trip.assert_not_called()
 
 
 class TokenRequestTests(unittest.IsolatedAsyncioTestCase):
