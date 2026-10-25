@@ -1,6 +1,7 @@
 """人工验证会话：持有服务器浏览器，回收 Cookie，并以 Token 确认结果。"""
 
 import asyncio
+import re
 import time
 from typing import Any, Dict, Optional
 
@@ -23,7 +24,7 @@ class ManualVerificationError(Exception):
 
 
 async def request_manual_token(cookies_str: str, *, retry_cookie_rotation: bool = True) -> Dict[str, Any]:
-    """Single Token request, without automatic solving or account mutations."""
+    """Initialize/rotate signing cookies at most once; never auto-solve challenges."""
     import json
     import aiohttp
     from app.config import API_ENDPOINTS
@@ -31,8 +32,9 @@ async def request_manual_token(cookies_str: str, *, retry_cookie_rotation: bool 
 
     cd = trans_cookies(cookies_str)
     token = cd.get('_m_h5_tk', '').split('_')[0]
-    if not token:
-        raise ManualVerificationError('token_confirm', '账号缺少签名 Cookie，请重新扫码登录')
+    # QR login can finish before the platform has issued the MTOP signing cookie.
+    # The first request may initialize it; absence alone does not prove login expiry.
+    cookies_str = '; '.join(f'{key}={value}' for key, value in cd.items())
 
     ts = str(int(time.time() * 1000))
     params = {
@@ -88,16 +90,45 @@ async def request_manual_token(cookies_str: str, *, retry_cookie_rotation: bool 
         ret = [ret]
     codes = ', '.join(str(value).split('::')[0][:80] for value in ret)[:240]
     updated_cookies = '; '.join(f'{key}={value}' for key, value in cd.items())
+    from utils.risk_control import is_risk_control_error
+    new_signing_token = cd.get('_m_h5_tk', '').split('_')[0]
     if (retry_cookie_rotation and not data.get('accessToken')
-            and any(code in codes for code in ('FAIL_SYS_TOKEN_EXOIRED', 'FAIL_SYS_TOKEN_EXPIRED'))
-            and cd.get('_m_h5_tk', '').split('_')[0] != token):
+            and not is_risk_control_error(codes)
+            and any(code in codes for code in ('FAIL_SYS_TOKEN_EXOIRED', 'FAIL_SYS_TOKEN_EXPIRED', 'FAIL_SYS_TOKEN_EMPTY'))
+            and new_signing_token and new_signing_token != token):
         return await request_manual_token(updated_cookies, retry_cookie_rotation=False)
+    if not new_signing_token and not data.get('accessToken') and not data.get('url'):
+        raise ManualVerificationError(
+            'token_initialize',
+            f'平台未返回可用的签名 Cookie（{codes or "无返回码"}）；'
+            '请检查扫码 Cookie 补全结果，不能仅凭此错误认定登录失效',
+        )
     return {
         'token': data.get('accessToken'),
         'url': data.get('url') or '',
         'cookies_str': updated_cookies,
         'reason': codes or '接口未返回 accessToken',
     }
+
+
+async def get_captcha_page_error(page) -> Optional[str]:
+    """Read visible challenge text, including iframe contents; never scan script source."""
+    for frame in page.frames:
+        try:
+            visible_text = await frame.locator('body').inner_text(timeout=1000)
+        except Exception:
+            # Detached/navigating frames do not prove either success or failure.
+            continue
+        match = re.search(
+            r'please\s+refresh\s+(?:the\s+page\s+)?and\s+try\s+again'
+            r'|请刷新[^\n。]{0,12}重试|刷新页面[^\n。]{0,12}重试',
+            visible_text, re.IGNORECASE,
+        )
+        if match:
+            code = re.search(r'error\s*[:：]\s*([a-zA-Z0-9_-]{1,40})', visible_text, re.IGNORECASE)
+            suffix = f"（页面错误码：{code.group(1)}）" if code else ''
+            return f'验证页面提示出错，请刷新后重试{suffix}；当前会话已结束，请点击“重新加载验证页”'
+    return None
 
 
 async def collect_verification_cookies(context, session_id: str, previous: str) -> str:
@@ -110,6 +141,9 @@ async def collect_verification_cookies(context, session_id: str, previous: str) 
     deadline = time.monotonic() + 5
     while True:
         await asyncio.sleep(0.25)
+        page_error = await get_captcha_page_error(captcha_controller.active_sessions[session_id]['page'])
+        if page_error:
+            raise ManualVerificationError('captcha_page', page_error)
         cookies = _from_playwright_cookies(await context.cookies([API_ENDPOINTS['token']]))
         current_pass = trans_cookies(cookies).get('x5sec') if cookies else None
         if ((current_pass and current_pass != previous_pass)
@@ -203,8 +237,8 @@ async def open_manual_session(
         captcha_appeared = await _wait_for_captcha_present(page, timeout=CAPTCHA_PRESENT_TIMEOUT)
         if not captcha_appeared:
             result["message"] = (
-                "已导航到惩罚页但未检测到滑块（x5secdata 可能已过期），"
-                "请让账号重新触发风控后重试"
+                "验证页面未检测到可见的滑块组件，请重新加载验证页；"
+                "若仍失败，请在闲鱼官方客户端检查账号验证要求"
             )
             logger.warning(f"【{cookie_id}】{result['message']}")
             raise ManualVerificationError(stage, result['message'])
@@ -257,6 +291,9 @@ async def open_manual_session(
                 result.update(success=True, cookies_str=confirmed['cookies_str'],
                               token=confirmed['token'], message='人工验证成功，Token 已确认')
                 return result
+            page_error = await get_captcha_page_error(page)
+            if page_error:
+                raise ManualVerificationError('captcha_page', f"{page_error}；Token 结果：{confirmed['reason']}")
             if confirmed.get('cookies_str'):
                 await context.add_cookies(_to_playwright_cookies(confirmed['cookies_str']))
             last_reason = f"[token_confirm] Token 确认失败：{confirmed['reason']}"
@@ -318,6 +355,9 @@ async def _wait_for_captcha_present(page, timeout: int = CAPTCHA_PRESENT_TIMEOUT
     ]
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        page_error = await get_captcha_page_error(page)
+        if page_error:
+            raise ManualVerificationError('captcha_page', page_error)
         # 先查主页面，再查 iframe（阿里滑块通常包在 iframe 里）
         for frame in page.frames:
             for selector in selectors:

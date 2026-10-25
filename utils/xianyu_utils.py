@@ -59,10 +59,13 @@ def trans_cookies(cookies_str: str) -> dict:
         raise ValueError("cookies不能为空")
 
     cookies = {}
-    for cookie in cookies_str.split("; "):
-        if "=" in cookie:
-            key, value = cookie.split("=", 1)
-            cookies[key] = value
+    for pair in cookies_str.split(';'):
+        if '=' not in pair:
+            continue
+        key, value = pair.split('=', 1)
+        key = key.strip()
+        if key:
+            cookies[key] = value.strip()
     return cookies
 
 

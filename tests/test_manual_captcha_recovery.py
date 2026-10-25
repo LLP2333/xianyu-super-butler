@@ -75,7 +75,7 @@ class RemoteInputTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
-    async def run_session(self, token_results, cancelled=False):
+    async def run_session(self, token_results, cancelled=False, page_errors=None):
         page = SimpleNamespace(goto=AsyncMock())
         context = SimpleNamespace(add_cookies=AsyncMock(), new_page=AsyncMock(return_value=page),
                                   cookies=AsyncMock(return_value=[{'name': '_m_h5_tk', 'value': 'signed_1'}, {'name': 'x5sec', 'value': 'passed'}]), close=AsyncMock())
@@ -86,7 +86,7 @@ class SessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         async def create(sid, page):
             event = asyncio.Event()
             event.set()
-            captcha_controller.active_sessions[sid] = {'released': event, 'cancelled': cancelled}
+            captcha_controller.active_sessions[sid] = {'released': event, 'cancelled': cancelled, 'page': page}
             captcha_controller.websocket_connections[sid] = ws
 
         async def push(message):
@@ -95,7 +95,7 @@ class SessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         ws.send_json.side_effect = push
         initial = {'token': None, 'url': 'https://example.test/punish', 'cookies_str': '_m_h5_tk=signed_1', 'reason': 'FAIL_SYS_USER_VALIDATE'}
-        with patch('playwright.async_api.async_playwright', return_value=SimpleNamespace(start=AsyncMock(return_value=playwright))), patch.object(manual_captcha.browser_limit, 'launch_browser', AsyncMock(return_value=browser)), patch.object(manual_captcha, 'request_manual_token', AsyncMock(side_effect=[initial, *token_results])) as request, patch.object(manual_captcha, '_wait_for_captcha_present', AsyncMock(return_value=True)), patch.object(captcha_controller, 'create_session', side_effect=create), patch.object(captcha_controller, 'auto_refresh_screenshot', AsyncMock()), patch.object(captcha_controller, 'check_completion', AsyncMock(return_value=True)), patch.object(manual_captcha.asyncio, 'sleep', AsyncMock()):
+        with patch('playwright.async_api.async_playwright', return_value=SimpleNamespace(start=AsyncMock(return_value=playwright))), patch.object(manual_captcha.browser_limit, 'launch_browser', AsyncMock(return_value=browser)), patch.object(manual_captcha, 'request_manual_token', AsyncMock(side_effect=[initial, *token_results])) as request, patch.object(manual_captcha, '_wait_for_captcha_present', AsyncMock(return_value=True)), patch.object(manual_captcha, 'get_captcha_page_error', AsyncMock(return_value=None, side_effect=page_errors)), patch.object(captcha_controller, 'create_session', side_effect=create), patch.object(captcha_controller, 'auto_refresh_screenshot', AsyncMock()), patch.object(captcha_controller, 'check_completion', AsyncMock(return_value=True)), patch.object(manual_captcha.asyncio, 'sleep', AsyncMock()):
             result = await manual_captcha.open_manual_session('account', '_m_h5_tk=old_1', session_id='session')
         self.assertNotIn('session', captcha_controller.active_sessions)
         browser.close.assert_awaited_once()
@@ -103,6 +103,25 @@ class SessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         playwright.stop.assert_awaited_once()
         captcha_controller.websocket_connections.clear()
         return result, request
+
+    async def test_error_after_drag_closes_session_without_requesting_token(self):
+        result, request = await self.run_session([], page_errors=['验证页面提示请刷新后重试'])
+        self.assertFalse(result['success'])
+        self.assertEqual(result['stage'], 'captcha_page')
+        self.assertEqual(request.await_count, 1)  # only the initial challenge request
+        self.assertNotIn('可继续操作', result['message'])
+        self.assertEqual(result['cookies_str'], '_m_h5_tk=old_1')
+
+    async def test_late_page_error_after_token_refusal_is_not_retryable(self):
+        result, request = await self.run_session(
+            [{'token': None, 'reason': 'FAIL_SYS_USER_VALIDATE, RGV587_ERROR'}],
+            page_errors=[None, '验证页面提示请刷新后重试'],
+        )
+        self.assertFalse(result['success'])
+        self.assertEqual(result['stage'], 'captcha_page')
+        self.assertIn('RGV587_ERROR', result['message'])
+        self.assertNotIn('可继续操作', result['message'])
+        self.assertEqual(request.await_count, 2)
 
     async def test_user_cancel_closes_browser_without_confirming_or_returning_cookies(self):
         result, request = await self.run_session([], cancelled=True)
@@ -278,7 +297,7 @@ class CrossLoopRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TokenRequestTests(unittest.IsolatedAsyncioTestCase):
-    async def request(self, responses):
+    async def request(self, responses, cookies='_m_h5_tk=old_1; unb=123; x5sec=passed'):
         from http.cookies import SimpleCookie
         contexts = []
         for payload, cookie in responses:
@@ -292,8 +311,56 @@ class TokenRequestTests(unittest.IsolatedAsyncioTestCase):
         session.__aenter__ = AsyncMock(return_value=session)
         session.__aexit__ = AsyncMock(return_value=False)
         with patch('aiohttp.ClientSession', return_value=session):
-            result = await manual_captcha.request_manual_token('_m_h5_tk=old_1; unb=123; x5sec=passed')
+            result = await manual_captcha.request_manual_token(cookies)
         return result, session.post
+
+    async def test_new_qr_login_initializes_missing_signing_cookie_then_confirms(self):
+        result, post = await self.request([
+            ({'ret': ['FAIL_SYS_TOKEN_EMPTY::empty']}, '_m_h5_tk=initialized_2; Path=/'),
+            ({'data': {'accessToken': 'confirmed'}, 'ret': ['SUCCESS::ok']}, ''),
+        ], cookies='unb=123; cookie2=login-session')
+        self.assertEqual(result['token'], 'confirmed')
+        self.assertEqual(post.call_count, 2)
+        first, second = post.call_args_list
+        self.assertNotIn('_m_h5_tk=', first.kwargs['headers']['cookie'])
+        self.assertIn('_m_h5_tk=initialized_2', second.kwargs['headers']['cookie'])
+        self.assertIn('cookie2=login-session', second.kwargs['headers']['cookie'])
+        self.assertNotEqual(first.kwargs['params']['sign'], second.kwargs['params']['sign'])
+
+    async def test_signing_cookie_bootstrap_stops_after_one_retry(self):
+        result, post = await self.request([
+            ({'ret': ['FAIL_SYS_TOKEN_EMPTY::empty']}, '_m_h5_tk=initialized_2'),
+            ({'ret': ['FAIL_SYS_TOKEN_EXOIRED::expired']}, '_m_h5_tk=rotated_again_3'),
+        ], cookies='unb=123; cookie2=login-session')
+        self.assertIsNone(result['token'])
+        self.assertEqual(post.call_count, 2)
+
+    async def test_missing_signing_cookie_does_not_discard_platform_challenge(self):
+        result, post = await self.request([
+            ({'ret': ['FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR'], 'data': {'url': 'https://example.test/punish'}}, ''),
+        ], cookies='unb=123; cookie2=login-session')
+        self.assertIsNone(result['token'])
+        self.assertEqual(result['url'], 'https://example.test/punish')
+        self.assertEqual(post.call_count, 1)
+
+    async def test_no_signing_cookie_response_reports_initialization_not_login_failure(self):
+        with self.assertRaises(manual_captcha.ManualVerificationError) as error:
+            await self.request([({'ret': ['FAIL_SYS_TOKEN_EMPTY']}, '')], cookies='unb=123')
+        self.assertEqual(error.exception.stage, 'token_initialize')
+        self.assertIn('FAIL_SYS_TOKEN_EMPTY', str(error.exception))
+        self.assertNotIn('请重新扫码登录', str(error.exception))
+
+    async def test_deleted_signing_cookie_does_not_trigger_empty_signature_retry(self):
+        with self.assertRaises(manual_captcha.ManualVerificationError):
+            await self.request([({'ret': ['FAIL_SYS_TOKEN_EXOIRED']}, '_m_h5_tk=; Max-Age=0')])
+
+    async def test_compact_cookie_header_preserves_signing_cookie(self):
+        result, post = await self.request([
+            ({'data': {'accessToken': 'confirmed'}, 'ret': ['SUCCESS::ok']}, ''),
+        ], cookies='unb=123;_m_h5_tk=already_2;cookie2=login-session')
+        self.assertEqual(result['token'], 'confirmed')
+        self.assertIn('_m_h5_tk=already_2', post.call_args.kwargs['headers']['cookie'])
+        self.assertEqual(post.call_count, 1)
 
     async def test_returns_response_cookie_rotation_with_confirmed_token(self):
         result, post = await self.request([({'data': {'accessToken': 'token'}, 'ret': ['SUCCESS::ok']}, '_m_h5_tk=new_2')])

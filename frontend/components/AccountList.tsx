@@ -193,7 +193,7 @@ const AccountList: React.FC = () => {
     captchaOriginRef.current = { x: 0, y: 0 };
     captchaVerifyingRef.current = false;
     captchaFinishedRef.current = false;
-    setCaptchaAccount(account);
+    setCaptchaAccount({ ...account });
     setCaptchaShot('');
     setCaptchaStage('starting');
     setCaptchaMessage('正在服务器上启动验证页面，请稍候…');
@@ -1214,6 +1214,20 @@ const AccountList: React.FC = () => {
                     : 'bg-amber-50 text-amber-800'
               }`}>
                 {captchaMessage || '正在准备…'}
+                {captchaStage === 'failed' && (
+                  <div className="mt-3">
+                    <button
+                      type="button"
+                      disabled={manualCaptchaId !== null}
+                      onClick={() => handleManualCaptcha(captchaAccount)}
+                      className="inline-flex items-center gap-2 rounded-md bg-amber-100 px-3 py-2 text-amber-900 disabled:opacity-50"
+                    >
+                      <RefreshCw className="h-4 w-4" />
+                      重新加载验证页
+                    </button>
+                    <p className="mt-2 text-xs font-normal">点击后会开启新的验证会话；若持续失败，请在闲鱼官方客户端检查账号验证要求。</p>
+                  </div>
+                )}
               </div>
 
               <div className="flex min-h-[320px] items-center justify-center rounded-md border-2 border-dashed border-gray-200 bg-gray-50 p-2">
