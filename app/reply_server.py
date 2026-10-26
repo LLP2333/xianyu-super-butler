@@ -2841,6 +2841,12 @@ def update_system_setting(key: str, setting_data: SystemSettingIn,
         if key == 'admin_password_hash':
             raise HTTPException(status_code=400, detail='请使用密码修改接口')
 
+        if key == 'browser_desktop_url':
+            from utils.account_browser.address import validate_desktop_address
+            try:
+                setting_data.value = validate_desktop_address(setting_data.value)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         success = db_manager.set_system_setting(key, setting_data.value, setting_data.description)
         if success:
             return {'msg': 'system setting updated'}

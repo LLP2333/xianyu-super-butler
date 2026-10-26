@@ -38,6 +38,12 @@ class AccountBrowserService:
             raise LookupError('浏览器未打开或无权访问')
         return browser
 
+    def desktop_url(self, user_id):
+        from utils.account_browser.address import validate_desktop_address
+        browser = self.desktop(user_id)
+        configured = self.db.get_system_setting('browser_desktop_url') or ''
+        return validate_desktop_address(configured) or browser.desktop.desktop_url
+
     async def stop(self):
         if self.listener:
             await self.listener.close()
@@ -70,7 +76,7 @@ class AccountBrowserService:
             self.setup_error = None
             browser = await self.ensure(user_id)
             return {'message': '请在原生浏览器登录闲鱼并打开消息页，系统会自动捕获 Cookie 和消息 Token 并添加账号。',
-                    'desktop_url': browser.desktop.desktop_url}
+                    'desktop_url': self.desktop_url(user_id)}
 
     async def capture_new_account(self, value):
         if self.pending_owner is None:
@@ -107,7 +113,7 @@ class AccountBrowserService:
         return {'account_id': self.created_id, 'message': self.setup_error or
                 ('账号已添加，消息连接结果请查看账号状态' if self.created_id else
                  (self.listener.error if self.listener else None) or '等待你在闲鱼网页登录并打开消息页'),
-                'desktop_url': browser.desktop.desktop_url}
+                'desktop_url': self.desktop_url(user_id)}
 
     async def takeover(self, account_id, user_id, restart=False):
         async with self.browsers.lock(PRIMARY):
@@ -125,7 +131,7 @@ class AccountBrowserService:
                 await self.stop()
             browser = await self.ensure(user_id, account_id, record['value'])
             return {'manual': True, 'message': '监听已就绪。请在原生浏览器完成验证并打开或刷新闲鱼消息页。',
-                    'desktop_url': browser.desktop.desktop_url}
+                    'desktop_url': self.desktop_url(user_id)}
 
     async def status(self, account_id, user_id):
         record = self.account(account_id, user_id)
@@ -203,7 +209,7 @@ class AccountBrowserService:
                 self.pending_owner = user_id
                 browser = await self.ensure(user_id)
             return {'message': '浏览器数据和旧登录凭证已清空，请重新登录；账号设置保留。',
-                    'desktop_url': browser.desktop.desktop_url}
+                    'desktop_url': self.desktop_url(user_id)}
 
     async def reconcile(self):
         await self.browsers.discover()

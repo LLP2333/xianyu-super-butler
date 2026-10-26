@@ -15,7 +15,7 @@ class DesktopAccessTests(unittest.TestCase):
         self.logged_in=True
         self.browser=SimpleNamespace(owner_id=7,desktop=SimpleNamespace(
             desktop_url='https://localhost:3001/',auth=aiohttp.BasicAuth('account','internal-key')))
-        self.service=SimpleNamespace(desktop=lambda *_:self.browser,clear=AsyncMock(return_value={'message':'cleared'}))
+        self.service=SimpleNamespace(desktop=lambda *_:self.browser,desktop_url=lambda *_:self.browser.desktop.desktop_url,clear=AsyncMock(return_value={'message':'cleared'}))
         def auth():
             if not self.logged_in: raise HTTPException(403,'denied')
             return {'user_id':7}
@@ -49,6 +49,13 @@ class DesktopAccessTests(unittest.TestCase):
         self.logged_in=False
         check=self.client.get('/api/account-browser/desktop-auth',headers={'x-desktop-key':'internal-key','x-desktop-session':session})
         self.assertEqual(check.status_code,403)
+
+    def test_custom_origin_link_keeps_ticket_authorization(self):
+        self.browser.desktop.desktop_url = 'https://browser.example.com/'
+        response = self.client.post('/api/account-browser/desktop-link', headers={'authorization':'Bearer app-session'})
+        self.assertTrue(response.json()['open_url'].startswith('https://browser.example.com/_desktop_open?ticket='))
+        ticket = parse_qs(urlsplit(response.json()['open_url']).query)['ticket'][0]
+        self.assertEqual(self.enter(ticket).status_code,303)
 
     def test_bad_container_key_cannot_consume_ticket(self):
         ticket=self.grant()

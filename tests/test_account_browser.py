@@ -15,6 +15,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         p.start(); self.addCleanup(p.stop)
         self.records = {'123': 'unb=123; cookie2=original'}
         self.db = MagicMock()
+        self.db.get_system_setting.return_value = None
         self.db.get_all_cookies.side_effect = lambda: dict(self.records)
         self.db.get_cookie_details.side_effect = lambda key: {'value':self.records[key],'user_id':7} if key in self.records else None
         self.db.get_cookie_status.return_value = True
@@ -39,6 +40,15 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 task=SimpleNamespace(done=lambda:False), ready=SimpleNamespace(is_set=lambda:True), error=None)
         p=patch('app.services.account_browser.TokenListener',side_effect=listener)
         p.start();self.addCleanup(p.stop)
+
+    async def test_configured_origin_used_by_desktop_and_setup(self):
+        self.db.get_system_setting.return_value = 'https://browser.example.com:9443'
+        self.assertEqual((await self.service.takeover('123',7))['desktop_url'], 'https://browser.example.com:9443/')
+        self.records.clear()
+        self.assertEqual((await self.service.setup(7))['desktop_url'], 'https://browser.example.com:9443/')
+        self.db.get_system_setting.return_value = ''
+        self.assertEqual(self.service.desktop_url(7), 'https://localhost:3001/')
+        with self.assertRaises(LookupError): self.service.desktop_url(8)
 
     def capture(self, account='123'):
         value=BrowserToken(account,'website-token','website-device','website-app',f'unb={account}; cookie2=web')

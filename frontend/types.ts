@@ -543,6 +543,7 @@ export interface OrderAnalytics {
 
 // Settings
 export interface SystemSettings {
+  browser_desktop_url?: string;
   ai_model?: string;
   ai_api_key?: string;
   ai_base_url?: string;

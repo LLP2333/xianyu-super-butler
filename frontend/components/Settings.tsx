@@ -98,6 +98,7 @@ const Settings: React.FC = () => {
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [customBrowserAddress, setCustomBrowserAddress] = useState(false);
   const [activeSection, setActiveSection] = useState<SettingsSection>('general');
   // 快捷短语：人工客服常用话术
   const [phrases, setPhrases] = useState<QuickPhrase[]>([]);
@@ -182,11 +183,17 @@ const Settings: React.FC = () => {
 
   const loadSettings = () => {
     setLoading(true);
-    getSystemSettings().then(setSettings).finally(() => setLoading(false));
+    getSystemSettings().then(value => { setSettings(value); setCustomBrowserAddress(Boolean(value.browser_desktop_url)); }).finally(() => setLoading(false));
   };
 
   const handleSave = async () => {
     if (!settings) return;
+    if (customBrowserAddress) {
+      try {
+        const url = new URL(settings.browser_desktop_url || '');
+        if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/') throw new Error();
+      } catch { notify('请填写 HTTPS 根地址，例如 https://browser.example.com'); return; }
+    }
     setSaving(true);
     try {
       await updateSystemSettings(settings);
@@ -271,6 +278,23 @@ const Settings: React.FC = () => {
 
       {activeSection === 'general' && (
         <div className="grid gap-4 xl:grid-cols-2">
+          <section className="section-panel">
+            <SectionHeader title="原生浏览器访问地址" description="选择本地桌面或已配置转发的外网域名，保存后下次打开桌面生效。" icon={ExternalLink} />
+            <div className="grid gap-4 p-4">
+              <label><span className="field-label">访问方式</span>
+                <select className="ios-input w-full px-3 py-2" value={customBrowserAddress ? 'custom' : 'local'}
+                  onChange={event => { const custom = event.target.value === 'custom'; setCustomBrowserAddress(custom); if (!custom) setSettings({ ...settings, browser_desktop_url: '' }); }}>
+                  <option value="local">本地地址（默认 https://localhost:3001）</option>
+                  <option value="custom">自定义域名地址</option>
+                </select>
+              </label>
+              {customBrowserAddress && <label><span className="field-label">浏览器 HTTPS 地址</span>
+                <input className="ios-input w-full px-3 py-2" placeholder="https://browser.example.com" value={settings.browser_desktop_url || ''}
+                  onChange={event => setSettings({ ...settings, browser_desktop_url: event.target.value })} />
+              </label>}
+              <p className="text-xs text-gray-500">域名需转发到同一个原生浏览器服务，并支持 WebSocket。打开时会自动附带一次性授权，无需桌面密码。</p>
+            </div>
+          </section>
           <section className="section-panel">
             <SectionHeader
               title="访问与安全"

@@ -41,7 +41,7 @@ def create_account_browser_router(require_operator, service, verify_session):
                     entries.pop(key, None)
         ticket = secrets.token_urlsafe(32)
         tickets[ticket] = (user['user_id'], bearer, now + 60, browser.desktop.auth.password)
-        return browser.desktop.desktop_url + '_desktop_open?' + urlencode({'ticket': ticket})
+        return service.desktop_url(user['user_id']) + '_desktop_open?' + urlencode({'ticket': ticket})
 
     def check_container(request):
         try:
