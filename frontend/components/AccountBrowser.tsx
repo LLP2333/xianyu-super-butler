@@ -20,12 +20,18 @@ export default function AccountBrowser({ account, initialWindow, onClose, onChan
   const [busy, setBusy] = useState(true);
   const [manual, setManual] = useState(false);
   const [created, setCreated] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [captureTime, setCaptureTime] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const windowRef = useRef(initialWindow);
 
   useEffect(() => {
     let cancelled = false;
     setBusy(true);
+    setCaptured(false);
+    setSaved(false);
+    setCaptureTime(null);
+    setStatus('正在连接监听，尚未确认捕获到 Cookie 和消息 Token');
     const request = account ? accountBrowserAction(account.id, 'open') : setupBrowserAccount();
     void request.then(result => {
       if (cancelled) return;
@@ -56,6 +62,9 @@ export default function AccountBrowser({ account, initialWindow, onClose, onChan
           const result = await accountBrowserStatus(account.id);
           if (cancelled) return;
           setCaptured(result.captured && result.listening);
+          if (result.captured && result.listening) {
+            setCaptureTime(previous => previous || new Date().toLocaleTimeString());
+          } else setCaptureTime(null);
           setStatus(result.message);
           setManual(result.manual);
         } else {
@@ -63,12 +72,13 @@ export default function AccountBrowser({ account, initialWindow, onClose, onChan
           if (cancelled) return;
           setStatus(result.message);
           if (result.account_id) {
+            setCaptureTime(previous => previous || new Date().toLocaleTimeString());
             setCreated(true); setManual(false); setMessage(result.message); onChanged();
             return;
           }
         }
       } catch (error) {
-        if (!cancelled) { setCaptured(false); setStatus(errorMessage(error)); }
+        if (!cancelled) { setCaptured(false); setCaptureTime(null); setStatus(`无法确认捕获状态：${errorMessage(error)}`); }
       }
       if (!cancelled) timer = setTimeout(poll, 2000);
     };
@@ -94,8 +104,13 @@ export default function AccountBrowser({ account, initialWindow, onClose, onChan
       const result = action === 'clear' ? await clearBrowserData()
         : await accountBrowserAction(account!.id, action);
       setMessage(result.message);
-      if (action === 'restart' || action === 'clear') { setDesktop(result); setCaptured(false); setManual(true); }
-      else { setManual(false); setCaptured(false); }
+      if (action === 'restart' || action === 'clear') {
+        setDesktop(result); setCaptured(false); setSaved(false); setCaptureTime(null); setManual(true);
+        setStatus('等待捕获 Cookie 和消息 Token，请登录闲鱼并打开或刷新消息页');
+      } else {
+        setManual(false); setCaptured(false); setSaved(action === 'confirm');
+        if (action === 'release') setCaptureTime(null);
+      }
       onChanged();
     } catch (error) { setMessage(errorMessage(error)); }
     finally { setBusy(false); }
@@ -110,7 +125,21 @@ export default function AccountBrowser({ account, initialWindow, onClose, onChan
         </div>
         <div className="p-5 space-y-4">
           <p role="status">{message}</p>
-          {manual && <p className="text-amber-700">{status}</p>}
+          <div role="status" aria-live="polite" aria-atomic="true"
+            className={`rounded-xl border p-4 space-y-2 ${captured || saved || created
+              ? 'border-green-200 bg-green-50 text-green-800'
+              : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
+            <p className="font-bold">{created ? '✓ Cookie 和消息 Token 已捕获，账号已添加'
+              : saved ? '✓ Cookie 已保存，消息 Token 已采用'
+              : captured ? '✓ Cookie 和消息 Token 已捕获'
+              : manual || busy ? '等待捕获 Cookie 和消息 Token' : '操作已结束，本次未更新登录状态'}</p>
+            {captureTime && <p className="text-sm">本窗口确认捕获时间：{captureTime}</p>}
+            <p className="text-sm">{created ? message
+              : saved ? '账号任务已恢复，可关闭窗口；实际消息连接结果请查看账号列表。'
+              : captured ? '登录凭证已就绪，请点击下方“采用网页 Token 并恢复”完成保存。'
+              : manual || busy ? status : '再次点击“重新连接监听”可继续捕获。'}</p>
+            {(manual || busy) && !captured && <p className="text-sm">在原生 Chrome 登录后，打开或刷新闲鱼消息页；这里每 2 秒自动检查一次。</p>}
+          </div>
           {desktop?.desktop_url && <>
             <button type="button" className="ios-btn-primary px-4 py-2" disabled={busy} onClick={() => void openDesktop()}>打开原生 Chrome 桌面 ↗</button>
             <p className="text-sm break-all">桌面地址：{desktop.desktop_url}（点击上方按钮自动授权，无需输入桌面密码）</p>
