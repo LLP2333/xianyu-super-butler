@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { accountBrowserAction, accountBrowserStatus, BrowserDesktop, setupBrowserAccount,
-  browserSetupStatus, browserDesktopLink, clearBrowserData } from '../services/api';
+  browserSetupStatus, browserDesktopLink, clearBrowserData, reconnectBrowserListener, BrowserListenerStatus } from '../services/api';
 import { confirmAction } from '../services/feedback';
 import { AccountDetail } from '../types';
 
@@ -22,7 +22,10 @@ export default function AccountBrowser({ account, initialWindow, onClose, onChan
   const [created, setCreated] = useState(false);
   const [saved, setSaved] = useState(false);
   const [captureTime, setCaptureTime] = useState<string | null>(null);
-  const [attempt, setAttempt] = useState(0);
+  const [listenerState, setListenerState] = useState<BrowserListenerStatus['listener_state'] | 'unknown'>('connecting');
+  const [listenerError, setListenerError] = useState<string | null>(null);
+  const [reconnecting, setReconnecting] = useState(false);
+  const updateListener = (result: BrowserListenerStatus) => { setListenerState(result.listener_state); setListenerError(result.listener_error || null); };
   const windowRef = useRef(initialWindow);
 
   useEffect(() => {
@@ -44,16 +47,16 @@ export default function AccountBrowser({ account, initialWindow, onClose, onChan
       }
       onChanged();
     }).catch(error => {
-      if (!cancelled) setMessage(errorMessage(error));
+      if (!cancelled) { setMessage(errorMessage(error)); setListenerState('disconnected'); setListenerError(errorMessage(error)); }
       windowRef.current?.close(); windowRef.current = null;
     }).finally(() => { if (!cancelled) setBusy(false); });
     return () => { cancelled = true; };
     // Parent list refreshes must not recreate the browser lifecycle.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [account?.id, attempt]);
+  }, [account?.id]);
 
   useEffect(() => {
-    if (!manual || created) return;
+    if (busy || !desktop) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
@@ -61,6 +64,7 @@ export default function AccountBrowser({ account, initialWindow, onClose, onChan
         if (account) {
           const result = await accountBrowserStatus(account.id);
           if (cancelled) return;
+          updateListener(result);
           setCaptured(result.captured && result.listening);
           if (result.captured && result.listening) {
             setCaptureTime(previous => previous || new Date().toLocaleTimeString());
@@ -70,22 +74,32 @@ export default function AccountBrowser({ account, initialWindow, onClose, onChan
         } else {
           const result = await browserSetupStatus();
           if (cancelled) return;
+          updateListener(result);
           setStatus(result.message);
           if (result.account_id) {
             setCaptureTime(previous => previous || new Date().toLocaleTimeString());
-            setCreated(true); setManual(false); setMessage(result.message); onChanged();
-            return;
+            if (!created) onChanged();
+            setCreated(true); setManual(false); setMessage(result.message);
           }
         }
       } catch (error) {
-        if (!cancelled) { setCaptured(false); setCaptureTime(null); setStatus(`无法确认捕获状态：${errorMessage(error)}`); }
+        if (!cancelled) { setListenerState('unknown'); setListenerError(errorMessage(error)); setCaptured(false); setCaptureTime(null); setStatus(`无法确认捕获状态：${errorMessage(error)}`); }
       }
       if (!cancelled) timer = setTimeout(poll, 2000);
     };
     void poll();
     return () => { cancelled = true; clearTimeout(timer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [account?.id, manual, created]);
+  }, [account?.id, busy, desktop, created]);
+
+  const reconnect = async () => {
+    setBusy(true); setReconnecting(true); setListenerState('connecting'); setListenerError(null);
+    try {
+      const result = await reconnectBrowserListener();
+      updateListener(result); setMessage(result.message); setCaptured(false); setCaptureTime(null);
+    } catch (error) { setListenerState('disconnected'); setListenerError(errorMessage(error)); }
+    finally { setBusy(false); setReconnecting(false); }
+  };
 
   const openDesktop = async () => {
     const opened = window.open('about:blank', '_blank');
@@ -125,6 +139,10 @@ export default function AccountBrowser({ account, initialWindow, onClose, onChan
         </div>
         <div className="p-5 space-y-4">
           <p role="status">{message}</p>
+          <div role="status" aria-live="polite" className={`rounded-xl border p-3 ${listenerState === 'listening' ? 'border-green-200 text-green-800' : 'border-amber-200 text-amber-800'}`}>
+            <p className="font-bold">浏览器监听：{{ connecting: reconnecting ? '重新连接中…' : '正在连接…', listening: '监听中', disconnected: '已断开', unknown: '状态查询失败' }[listenerState]}</p>
+            <p className="text-sm">{listenerError || (listenerState === 'listening' ? '监听连接正常，正在接收网页登录结果，无需重新连接。' : '连接异常时可点击下方“重新连接监听”，无需重启浏览器。')}</p>
+          </div>
           <div role="status" aria-live="polite" aria-atomic="true"
             className={`rounded-xl border p-4 space-y-2 ${captured || saved || created
               ? 'border-green-200 bg-green-50 text-green-800'
@@ -149,7 +167,7 @@ export default function AccountBrowser({ account, initialWindow, onClose, onChan
           <p className="text-sm text-gray-500">{account ? '人工操作期间账号任务暂停，关闭本窗口不会自动恢复。' : '当前先使用一个账号，完成登录后可在账号列表查看连接状态。'}</p>
         </div>
         <div className="modal-footer flex flex-wrap gap-2">
-          <button type="button" className="ios-btn-secondary px-3 py-2" disabled={busy || created} onClick={() => setAttempt(n => n + 1)}>重新连接监听</button>
+          <button type="button" className="ios-btn-secondary px-3 py-2" disabled={busy || listenerState === 'listening'} onClick={() => void reconnect()}>{reconnecting ? '重新连接中…' : listenerState === 'listening' ? '监听正常' : '重新连接监听'}</button>
           <button type="button" className="ios-btn-secondary px-3 py-2 text-red-600" disabled={busy || created} onClick={() => void act('clear')}>清空浏览器数据</button>
           {account && <>
             <button type="button" className="ios-btn-secondary px-3 py-2" disabled={busy || !manual} onClick={() => void act('restart')}>重启浏览器</button>

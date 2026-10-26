@@ -108,9 +108,34 @@ class AccountBrowserService:
                     tokens.pause(self.created_id)
                 self.setup_error = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else '账号保存或启动失败，请重试'
 
+    def listener_status(self):
+        listener = self.listener
+        running = bool(listener and listener.task and not listener.task.done())
+        connected = bool(running and listener.ready.is_set() and listener.context is not None)
+        return {'listening': connected,
+                'listener_state': 'listening' if connected else 'connecting' if running and not listener.ready.is_set() else 'disconnected',
+                'listener_error': listener.error if listener else None}
+
+    async def reconnect(self, user_id):
+        async with self.browsers.lock(PRIMARY):
+            self.desktop(user_id)
+            records = self.db.get_all_cookies()
+            account_id = next(iter(records), None)
+            record = self.account(account_id, user_id) if account_id else None
+            if not record and self.pending_owner != user_id:
+                raise LookupError('没有待添加的账号')
+            if record and not self.db.get_cookie_status(account_id):
+                raise ValueError('请先启用账号')
+            if self.listener:
+                await self.listener.close()
+                self.listener = None
+            await self.ensure(user_id, account_id, record['value'] if record else None)
+            return {**self.listener_status(), 'message': '监听已重新连接，请打开或刷新闲鱼消息页',
+                    'desktop_url': self.desktop_url(user_id)}
+
     async def setup_status(self, user_id):
         browser = self.desktop(user_id)
-        return {'account_id': self.created_id, 'message': self.setup_error or
+        return {**self.listener_status(), 'account_id': self.created_id, 'message': self.setup_error or
                 ('账号已添加，消息连接结果请查看账号状态' if self.created_id else
                  (self.listener.error if self.listener else None) or '等待你在闲鱼网页登录并打开消息页'),
                 'desktop_url': self.desktop_url(user_id)}
@@ -136,9 +161,8 @@ class AccountBrowserService:
     async def status(self, account_id, user_id):
         record = self.account(account_id, user_id)
         listener = self.listener
-        connected = bool(listener and listener.account_id == account_id and listener.task and not listener.task.done() and listener.ready.is_set())
         value = tokens.get(account_id, candidate=True)
-        return {'manual': account_id in self.manual, 'listening': connected,
+        return {**self.listener_status(), 'manual': account_id in self.manual,
                 'captured': bool(value and value.account == trans_cookies(record['value']).get('unb')),
                 'message': self.errors.get(account_id) or (listener.error if listener else None) or
                 ('已捕获网页消息 Token，可确认并恢复' if value else '等待网页消息 Token，请打开或刷新闲鱼消息页')}

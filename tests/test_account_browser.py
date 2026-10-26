@@ -37,9 +37,25 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         def listener(key, expected, browser, callback):
             return SimpleNamespace(account_id=key, expected_account=expected, browser=browser,
                 current_account=AsyncMock(return_value='123'), start=AsyncMock(), close=AsyncMock(),
-                task=SimpleNamespace(done=lambda:False), ready=SimpleNamespace(is_set=lambda:True), error=None)
+                context=object(), task=SimpleNamespace(done=lambda:False), ready=SimpleNamespace(is_set=lambda:True), error=None)
         p=patch('app.services.account_browser.TokenListener',side_effect=listener)
         p.start();self.addCleanup(p.stop)
+
+    async def test_listener_status_and_reconnect_reuse_browser(self):
+        await self.service.takeover('123',7)
+        original = self.service.listener
+        self.assertEqual((await self.service.status('123',7))['listener_state'], 'listening')
+        original.task.done = lambda: True
+        original.error = 'CDP disconnected'
+        status = await self.service.status('123',7)
+        self.assertEqual(status['listener_state'], 'disconnected')
+        self.assertEqual(status['listener_error'], 'CDP disconnected')
+        result = await self.service.reconnect(7)
+        original.close.assert_awaited_once()
+        self.assertIsNot(self.service.listener, original)
+        self.assertEqual(result['listener_state'], 'listening')
+        self.browsers.stop.assert_not_awaited()
+        self.manager.pause_cookie_task.assert_awaited_once()
 
     async def test_configured_origin_used_by_desktop_and_setup(self):
         self.db.get_system_setting.return_value = 'https://browser.example.com:9443'

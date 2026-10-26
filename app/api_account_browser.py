@@ -71,6 +71,10 @@ def create_account_browser_router(require_operator, service, verify_session):
     async def setup_status(user=Depends(require_operator)):
         return await call(service.setup_status(user['user_id']))
 
+    @router.post('/reconnect')
+    async def reconnect(user=Depends(require_operator)):
+        return await call(service.reconnect(user['user_id']))
+
     @router.post('/desktop-link')
     async def desktop_link(request: Request, user=Depends(require_operator)):
         async def operation():
