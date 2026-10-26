@@ -1,54 +1,100 @@
-# 账号常驻浏览器
+# 单账号原生浏览器登录
 
-每个启用账号拥有一个有界面 Chromium、独立 Xvfb 桌面、Openbox 窗口管理器和只监听回环地址的 x11vnc 服务。账号数据目录位于 `data/browser_profiles/`，目录名由平台用户 ID 和账号 ID 的组合散列生成。
+账号管理先使用一个账号、一份浏览器资料和固定 HTTPS 端口 `3001`。桌面由官方 `lscr.io/linuxserver/chrome:latest` 直接提供，管家不转发画面或鼠标输入，不主动请求闲鱼消息 Token。
+
+## 目录与职责
 
 ```text
-frontend/components/AccountBrowser.tsx  # noVNC 远程桌面与接管按钮
-app/api_account_browser.py             # 账号鉴权、一次性连接票据、VNC 二进制转发
-app/services/account_browser.py        # 接管、Token 确认、凭证保存、后台巡视
+app/
+├─ api_account_browser.py              # 管理员入口、一次性桌面链接、访问会话认证
+├─ services/account_browser.py         # 首次添加、暂停/恢复、账号归属、明确清空操作
+└─ db_manager.py                       # 原子创建单个账号，禁止覆盖已有账号
 utils/account_browser/
-├── manager.py                         # 每账号单实例、持久化目录、Cookie 检查点
-└── desktop.py                         # 私有 X 显示、窗口管理器、VNC 进程
-app/cookie_manager.py                  # 在账号事件循环中暂停及恢复自动任务
-utils/manual_captcha.py                # Cookie 格式转换与 Token 请求
+├─ containers.py                       # 官方容器、固定端口、专属资料卷、限定范围清空
+├─ manager.py                          # 浏览器生命周期、内网 CDP 连接
+├─ listener.py                         # 被动读取网页 Token 响应并核对 Cookie 身份
+└─ tokens.py                           # 线程安全的内存消息 Token 与授权状态
+frontend/components/
+├─ AccountList.tsx                     # 单账号入口和账号运行状态
+└─ AccountBrowser.tsx                  # 打开桌面、登录进度、明确确认清空
+XianyuAutoAsync.py                     # 使用网页 Token 注册消息服务，成功响应后才标记连接
+deploy/account-browser/
+├─ cdp.conf                           # 只读挂载的内网调试接口，保留独立认证
+└─ desktop-auth.py                    # 官方启动钩子，只替换桌面认证，保留原生所有位置和输入路径
 ```
 
-## 操作与状态
+原扫码添加弹窗、扫码添加接口、手工 POST Cookie 添加入口已删除。已有账号可继续编辑设置；多账号业务模块没有扩展，此入口一次只允许一个账号。
 
-- 启用账号后，后台会启动并维持其浏览器；巡视间隔为 10 秒，启动多个账号可能需要更长时间。
-- “打开浏览器”会暂停该账号自动任务并取得操作权；再次打开重用同一浏览器。一个账号同时只有一个远程操作连接，新连接替换旧连接。
-- “关闭窗口”只断开连接，浏览器继续运行，账号仍保持接管。列表显示“浏览器接管中”。
-- “打开验证页”在现有浏览器中打开实时获得的验证链接。验证页面出错时，可直接使用浏览器刷新或再次点击此按钮。
-- “确认登录并恢复”先断开键鼠输入，再检查浏览器中登录的闲鱼用户与原账号一致；仅在 Token 成功后保存 Cookie、清除风控状态并恢复自动任务。失败则保留浏览器及接管状态，可重新连接继续处理。
-- “不保存并结束接管”使用数据库中原有凭证恢复任务，不向数据库保存当前浏览器凭证。浏览器数据目录仍保留。
-- 禁用或删除账号后，后台巡视停止对应浏览器。禁用保留数据目录。
-- 进程异常退出后重新启动新进程，并使用原数据目录。服务重启保留浏览器登录数据；内存中的远程连接和接管状态不会跨服务重启保留。
+## 首次添加：同一个浏览器生命周期
 
-浏览器 profile 持久化本地存储等状态。另保存 Cookie 检查点，以保留 Chromium 干净退出时可能清除的 session Cookie；正常每 10 秒及关闭前写入。突然断电可能丢失最近一次检查点后的修改。数据库凭证发生变化（例如重新扫码）后，非接管状态下同步至浏览器。
+```text
+点击“浏览器添加账号”
+  → 启动 primary 原生浏览器（此时数据库中还没有闲鱼账号）
+  → 建立只读监听 → 一次性链接打开 https://localhost:3001
+  → 用户在 Chrome 中登录、完成网站验证、打开 www.goofish.com/im
+  → 网页自行获取消息 Token
+  → 核对请求 Cookie 的 unb 与当前 Cookie 的 unb 一致
+  → 原子创建账号记录，保存 Cookie，授权该网页消息 Token
+  → 同一浏览器、同一 profile、同一监听继续运行，无重启或资料迁移
+  → 账号任务使用网页 Token 与对应 deviceId/appKey 连接消息服务
+  → 收到 /reg 成功响应后显示“监听中”
+```
 
-自动回复、消息连接仍由现有账号任务执行；这次替换的是人工操作及其浏览器生命周期，没有将商品抓取等所有独立自动化浏览器任务统一迁入常驻实例。
+已有账号通过“打开浏览器”进入时，先暂停账号任务；完成验证并捕获新 Token 后，点击“采用网页 Token 并恢复”。账号身份必须与已有记录一致。登录失败、未产生 Token 或重复账号均不会被当作添加成功。
+
+关闭管理弹窗不会停止浏览器或监听。首次添加可在后台完成；用户可重新打开入口查看进度。浏览器独立保留 profile；管家正常停止时关闭其监听和浏览器，让 Chrome 写入数据。
+
+## 三种凭证
+
+| 凭证 | 用途 | 存储/传递 |
+| --- | --- | --- |
+| 桌面一次性票据 | 从管家打开原生桌面，免输用户名/密码 | 随机票据，60 秒内一次有效；兑换后跳转根路径，不继续留在地址栏 |
+| 闲鱼 Cookie | 账号登录状态以及其他账号业务请求 | 捕获并核对后保存在账号数据库 |
+| 闲鱼消息 Token | 管家的聊天连接注册 | 仅内存保存，不下发前端、不写日志；到期或被拒绝后等待网页新 Token |
+
+桌面票据不包含闲鱼 Cookie、消息 Token、管家登录 Token或内部调试密码。兑换后使用 Secure、HttpOnly、SameSite=Lax 的桌面会话 Cookie，访问期限一小时；管理员退出登录或容器重建后，新请求不能继续访问。已经建立的原生 WebSocket 不会因票据到期自动断开，关闭/重启浏览器会终止连接。
+
+桌面 nginx 在本容器内检查会话，静态资源和 WebSocket 仍直接由原版 Selkies 提供。仅认证请求访问管家；画面与输入不经过管家。CDP 仍有独立 Basic Auth，仅在 Docker 内网可达，不公开端口或密码。
+
+## 清空浏览器数据
+
+界面提供“清空浏览器数据”，必须在确认框中明确确认后才执行：
+
+1. 暂停账号任务，撤销内存消息 Token；已有账号保留身份和业务设置，清除已保存的旧登录 Cookie。
+2. 关闭该浏览器和监听。
+3. 校验部署及用户归属，只删除该 `primary` 容器的 `/config` 命名数据卷。
+4. 创建干净浏览器，固定端口仍为 `3001`。用户重新登录。
+
+清空范围包括 Chrome 登录资料、Cookie、缓存、本地存储、历史等 `/config` 内数据；不会删除账号设置、商品、订单或其他浏览器的历史数据卷。没有点击确认不会清空。
 
 ## 部署
 
-重新构建 `Dockerfile` 或 `Dockerfile-cn`，镜像已安装 `xvfb`、`x11vnc`、`openbox` 和中文字体。现有 Compose 的 `./data:/app/data` 挂载会保留浏览器数据。每账号常驻 Chromium 会增加内存占用，请按账号数量调整 Compose 的内存限制。
-
-远程桌面仅向系统管理员开放，并校验账号归属。各桌面共享应用容器的操作系统，不构成不可信租户之间的操作系统安全隔离，普通平台用户不能取得连接票据。
-
-继续只暴露应用的 8080 端口，不发布 VNC 端口。noVNC 由 npm 依赖打包，无需 CDN。FastAPI 代理二进制 WebSocket 到本机 VNC，不需要额外 websockify 进程。代理须支持 WebSocket Upgrade 和长连接；仓库 nginx 配置已更新。
-
-使用单个应用进程。账号浏览器和连接票据归该进程管理，不能用多个 Uvicorn worker 共享同一批 profile。此功能需要 Linux 桌面组件，推荐在 Docker 中运行。
-
-## 验证
-
-单元测试覆盖跨用户访问、票据重放/过期、Cookie 身份核对、Token 失败不保存、接管期间禁止自动重启，以及跨事件循环恢复。
-
-真实桌面测试使用本地网页，不访问真实闲鱼账号：
-
 ```sh
-cd frontend
-node --input-type=module -e "import {build} from 'vite'; await build({base:'/client/',build:{outDir:'/tmp/account-browser-ui',emptyOutDir:true,rollupOptions:{input:'tests/account-browser.html'}}})"
-cd ..
-RUN_DESKTOP_TESTS=1 ACCOUNT_BROWSER_UI_DIR=/tmp/account-browser-ui python -m unittest tests.test_account_browser_desktop
+docker pull lscr.io/linuxserver/chrome:latest
+export ACCOUNT_BROWSER_CDP_CONFIG="$PWD/deploy/account-browser/cdp.conf"
+docker compose build
+docker compose up -d
 ```
 
-桌面测试需要 Chromium、Xvfb、Openbox、x11vnc 以及项目 Python 依赖。它从实际 React 组件通过 noVNC 操作地址栏、输入框和按钮，验证关闭重开、账号隔离、进程退出清理和重启后 Cookie/本地存储保留。真实闲鱼风控是否解除仍须在实际部署中验收。
+| 配置 | 默认值 | 用途 |
+| --- | --- | --- |
+| ACCOUNT_BROWSER_IMAGE | lscr.io/linuxserver/chrome:latest | 官方镜像，无自定义镜像构建 |
+| ACCOUNT_BROWSER_NETWORK | xianyu-browsers | 浏览器与管家使用的 Docker 网络 |
+| ACCOUNT_BROWSER_CDP_CONFIG | Compose 目录下 deploy/account-browser/cdp.conf | Docker 宿主机上的绝对路径 |
+| ACCOUNT_BROWSER_API_URL | http://xianyu-app:8080 | 浏览器容器可访问的管家内网地址，用于桌面认证 |
+| ACCOUNT_BROWSER_BIND | 127.0.0.1 | 固定宿主端口 3001 的绑定地址 |
+| ACCOUNT_BROWSER_HOST | localhost | 用户看到的桌面主机名 |
+
+NAS 使用 `docker-compose.nas.yml`，设置正确宿主机配置路径、绑定地址和主机名。`3001` 必须未被其他服务占用；不会自动改成随机端口。镜像自签名证书提示仍由用户核对地址后处理，一次性链接不绕过浏览器证书检查。
+
+镜像仅增加启动参数、持久资料卷、只读 CDP 配置，以及一个[官方支持的 `/custom-cont-init.d/` 初始化脚本](https://docs.linuxserver.io/general/container-customization/)。初始化脚本以 root 所有权安装到容器，修改桌面认证而不改写原生静态资源或输入协议。脚本失败时不会撤掉原有认证；健康检查失败后管家停止该容器。
+
+管家仍需 Docker 管理权限；浏览器本身不挂载 Docker socket。命名卷以部署 ID、用户和固定 primary 槽位命名；已有旧版账号浏览器数据卷不自动迁移或删除。
+
+## 验证边界
+
+单元测试包括首次捕获后自动建号、重复账号不覆盖、身份切换拒绝、Token 到期/拒绝、桌面票据一次性/过期/登录退出/容器重建失效、清空前明确确认及归属校验。
+
+原生集成测试使用独立官方 Chrome：通过 HTTP 管家测试页点击 HTTPS 桌面链接，验证免密码打开、原生 Selkies 输入组件正常加载；并验证实际网页只发送一次 Token 请求，监听器捕获其响应而不补发请求。
+
+真实验收仍需用户完成闲鱼登录与网站验证，捕获真实 Token 后观察消息注册及收发。捕获 Token 或测试通过，都不等于平台已经接受真实账号的独立消息连接。

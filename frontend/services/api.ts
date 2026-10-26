@@ -112,14 +112,6 @@ export const refreshAccountProfile = async (id: string): Promise<{ success: bool
   return post(`/cookies/${id}/refresh-profile`);
 };
 
-export const generateQRLogin = async (): Promise<{ success: boolean; session_id?: string; qr_code_url?: string }> => {
-  return post('/qr-login/generate');
-};
-
-export const checkQRLoginStatus = async (sessionId: string): Promise<any> => {
-  return get(`/qr-login/check/${sessionId}`);
-};
-
 export const updateAccountStatus = async (id: string, enabled: boolean): Promise<any> => {
   return put(`/cookies/${id}/status`, { enabled });
 };
@@ -337,11 +329,16 @@ export const getRiskControlStatus = async (): Promise<{
   return get('/api/risk-control/status');
 };
 
-export const accountBrowserAction = (accountId: string, action: 'open' | 'challenge' | 'confirm' | 'release'): Promise<{ message: string }> =>
-  post(`/api/account-browser/${encodeURIComponent(accountId)}/${action}`, {}, { timeout: 120000 });
+export type BrowserDesktop = { message: string; desktop_url?: string; open_url?: string };
 
-export const accountBrowserTicket = (accountId: string): Promise<{ ticket: string }> =>
-  post(`/api/account-browser/${encodeURIComponent(accountId)}/ticket`, {});
+export const accountBrowserAction = (accountId: string, action: 'open' | 'restart' | 'confirm' | 'release'): Promise<BrowserDesktop> =>
+  post(`/api/account-browser/${encodeURIComponent(accountId)}/${action}`, {}, { timeout: 120000 });
+export const setupBrowserAccount = (): Promise<BrowserDesktop> => post('/api/account-browser/setup', {}, { timeout: 120000 });
+export const browserSetupStatus = (): Promise<{ account_id?: string; message: string }> => get('/api/account-browser/setup-status');
+export const browserDesktopLink = (): Promise<{ open_url: string }> => post('/api/account-browser/desktop-link', {});
+export const clearBrowserData = (): Promise<BrowserDesktop> => post('/api/account-browser/clear', { confirmed: true }, { timeout: 120000 });
+export const accountBrowserStatus = (accountId: string): Promise<{ manual: boolean; captured: boolean; listening: boolean; message: string }> =>
+  get(`/api/account-browser/${encodeURIComponent(accountId)}/status`);
 
 // 商品擦亮：重新获取搜索曝光，平台对每日次数有限制
 export const polishItems = async (cookieId?: string, itemIds?: string[]): Promise<any> => {

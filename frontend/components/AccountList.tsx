@@ -6,8 +6,6 @@ import {
   getAccountDetails,
   updateAccountStatus,
   deleteAccount,
-  generateQRLogin,
-  checkQRLoginStatus,
   updateAccountRemark,
   updateAccountAutoConfirm,
   updateAccountPauseDuration,
@@ -20,7 +18,7 @@ import {
   getRiskControlStatus,
 } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
-import {Power, Edit2, Trash2, QrCode, X, Check, Loader2, MessageSquare, RefreshCw, Save, User, Clock, Key, Eye, EyeOff, Bot, Settings, MapPin, Users, ShieldCheck} from 'lucide-react';
+import {Power, Edit2, Trash2, X, Check, Loader2, MessageSquare, RefreshCw, Save, User, Clock, Key, Eye, EyeOff, Bot, Settings, MapPin, Users, ShieldCheck} from 'lucide-react';
 import { EmptyState, PageHeader, PageLoading } from './ui';
 
 type ModalType = 'edit' | 'ai-settings' | null;
@@ -33,18 +31,13 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
     cookie_id: string;
     blocked: boolean;
     remaining_seconds: number;
+    verification_required?: boolean;
     verification_type: 'none' | 'slider' | 'face' | 'qr' | 'risk_control';
     verification_message: string;
     verification_url?: string;
   }>>([]);
-  const [showQRModal, setShowQRModal] = useState(false);
-  const [qrCodeUrl, setQrCodeUrl] = useState<string>('');
-  const [qrStatus, setQrStatus] = useState<string>('pending');
-  const [qrMessage, setQrMessage] = useState<string>('');
-  const [verificationQrUrl, setVerificationQrUrl] = useState<string>('');
-  const [verificationUrl, setVerificationUrl] = useState<string>('');
-  const qrPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const qrSessionRef = useRef<string>('');
+  const [addingAccount, setAddingAccount] = useState(false);
+  const setupWindowRef = useRef<Window | null>(null);
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [editingAccount, setEditingAccount] = useState<AccountDetail | null>(null);
   const [refreshingProfileId, setRefreshingProfileId] = useState<string | null>(null);
@@ -134,8 +127,6 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
     }, 30000);
     return () => {
       clearInterval(timer);
-      qrSessionRef.current = '';
-      if (qrPollTimerRef.current) clearTimeout(qrPollTimerRef.current);
     };
   }, []);
 
@@ -280,117 +271,30 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
     }
   };
 
-  const startQRLogin = async () => {
-    qrSessionRef.current = '';
-    if (qrPollTimerRef.current) clearTimeout(qrPollTimerRef.current);
-    setShowQRModal(true);
-    setQrStatus('loading');
-    setQrMessage('');
-    setVerificationQrUrl('');
-    setVerificationUrl('');
-    try {
-      const res = await generateQRLogin();
-      if (res.success && res.qr_code_url && res.session_id) {
-        setQrCodeUrl(res.qr_code_url);
-        setQrStatus('waiting');
-        setQrMessage('等待扫码');
-        qrSessionRef.current = res.session_id;
-
-        const pollStatus = async () => {
-          if (qrSessionRef.current !== res.session_id) return;
-          try {
-            const statusRes = await checkQRLoginStatus(res.session_id!);
-            if (qrSessionRef.current !== res.session_id) return;
-
-            if (statusRes.status === 'success') {
-              qrSessionRef.current = '';
-              if (statusRes.account_ready) {
-                setQrStatus('success');
-                setQrMessage(statusRes.message || '账号 Cookie 已刷新并保存');
-                setTimeout(() => {
-                  setShowQRModal(false);
-                  loadAccounts();
-                }, 1000);
-              } else {
-                setQrStatus('error');
-                setQrMessage(statusRes.message || '扫码已确认，但账号 Cookie 未准备完成');
-                loadAccounts();
-              }
-              return;
-            }
-
-            if (statusRes.status === 'scanned') {
-              setQrStatus('scanned');
-              setQrMessage('已扫码，请在手机上确认登录');
-            } else if (statusRes.status === 'processing') {
-              setQrStatus('processing');
-              setQrMessage(statusRes.message || '已确认，正在准备账号...');
-            } else if (
-              statusRes.status === 'expired' ||
-              statusRes.status === 'error' ||
-              statusRes.status === 'cancelled' ||
-              statusRes.status === 'not_found'
-            ) {
-              qrSessionRef.current = '';
-              setQrStatus('error');
-              setQrMessage(statusRes.message || '二维码已失效，请重试');
-              return;
-            } else if (statusRes.status === 'verification_required') {
-              // 不能在这里停止轮询：用户正要去手机上完成人脸验证，
-              // 验证走完后状态才会变成 success。原实现清掉 session 直接 return，
-              // 于是验证做完页面永远停在「请完成验证」，只能关掉重来。
-              setQrStatus('verification_required');
-              setQrMessage(statusRes.message || '请使用手机扫描二维码完成安全验证');
-              if (statusRes.verification_qr_code_url) {
-                setVerificationQrUrl(statusRes.verification_qr_code_url);
-              }
-              if (statusRes.verification_url) {
-                setVerificationUrl(statusRes.verification_url);
-              }
-              // 验证要花上一两分钟，放慢轮询节奏即可
-              qrPollTimerRef.current = setTimeout(pollStatus, 2000);
-              return;
-            }
-
-            qrPollTimerRef.current = setTimeout(pollStatus, 800);
-          } catch (error) {
-            qrSessionRef.current = '';
-            setQrStatus('error');
-            setQrMessage(error instanceof Error ? error.message : '扫码状态查询失败');
-          }
-        };
-
-        qrPollTimerRef.current = setTimeout(pollStatus, 300);
-      } else {
-        setQrStatus('error');
-        setQrMessage('二维码生成失败，请重试');
-      }
-    } catch (e) {
-      setQrStatus('error');
-      setQrMessage(e instanceof Error ? e.message : '扫码登录请求失败');
-    }
-  };
-
-  const closeQRModal = () => {
-    qrSessionRef.current = '';
-    if (qrPollTimerRef.current) clearTimeout(qrPollTimerRef.current);
-    setShowQRModal(false);
+  const startBrowserLogin = () => {
+    const opened = window.open('about:blank', '_blank');
+    if (opened) opened.opener = null;
+    setupWindowRef.current = opened;
+    setAddingAccount(true);
   };
 
   const getRuntimeBadge = (account: AccountDetail) => {
     if (!account.enabled) {
       return { label: '已暂停', className: 'bg-gray-100 text-gray-500' };
     }
+    if (account.runtime_state === 'waiting_browser') {
+      return { label: '等待网页 Token', className: 'bg-amber-100 text-amber-800' };
+    }
     if (account.runtime_state === 'running') {
       return { label: '监听中', className: 'bg-green-100 text-green-700' };
     }
-    // 登录态过期是终态：等待和过验证都没用，必须重新扫码。
+    // 登录态过期时，需要在原生浏览器重新登录。
     // 与「连接中」分开显示，否则用户会一直等一个不会变好的状态。
     if (account.runtime_state === 'manual') {
-      return { label: '浏览器接管中', className: 'bg-amber-100 text-amber-800' };
+      return { label: '人工操作中', className: 'bg-amber-100 text-amber-800' };
     }
     if (account.runtime_state === 'need_relogin') {
-      return { label: '需重新扫码', className: 'bg-red-100 text-red-700' };
+      return { label: '需重新登录', className: 'bg-red-100 text-red-700' };
     }
     if (account.runtime_state === 'failed') {
       return { label: '监听异常', className: 'bg-red-100 text-red-700' };
@@ -416,18 +320,20 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
             {riskBlocked.map(item => `${item.cookie_id}：${item.verification_message || '平台风控'}`).join('；')}。
             {/* 只有本地熔断中才有确切的恢复时间；闲鱼侧的验证要求要靠过验证解除，
                 写死「N 分钟后恢复」会让用户干等一个不会自动好的状态 */}
-            {riskBlocked.some(a => a.blocked) ? (
+            {riskBlocked.some(a => a.verification_required) ? (
+              <> 自动重试已停止。请打开原生浏览器，在闲鱼消息页完成验证；捕获 Token 后点「采用网页 Token 并恢复」。</>
+            ) : riskBlocked.some(a => a.blocked) ? (
               <>
                 {' '}系统会自动退避并重试，预计
                 {' '}
                 {Math.max(1, Math.ceil(Math.max(...riskBlocked.map(a => a.remaining_seconds || 0)) / 60))}
                 {' '}
-                分钟后允许重试，是否恢复以 Token 确认结果为准；也可使用下方「人工验证」。
+                分钟后允许重试，是否恢复以 Token 确认结果为准；也可使用下方「打开浏览器」。
               </>
             ) : (
               <>
                 {' '}本地冷却已结束，但闲鱼仍要求完成验证。请用下方账号卡片里的
-                「人工验证」完成滑块，系统取得 Token 后会恢复账号任务。
+                「打开浏览器」完成网站验证，系统取得 Token 后会恢复账号任务。
               </>
             )}
           </p>
@@ -439,15 +345,16 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
         description="管理闲鱼账号授权、监听状态、基础资料和账号级回复策略。"
         icon={Users}
         badge={<span className="status-badge status-badge-info">{accounts.length} 个账号</span>}
-        actions={(
+        actions={accounts.length === 0 ? (
           <button
-            onClick={startQRLogin}
+            onClick={startBrowserLogin}
+            disabled={!isAdmin}
             className="ios-btn-primary flex items-center justify-center gap-2 rounded-md px-4 py-2 text-sm"
           >
-            <QrCode className="h-4 w-4" />
-            扫码添加账号
+            <ShieldCheck className="h-4 w-4" />
+            浏览器添加账号
           </button>
-        )}
+        ) : undefined}
       />
 
       <p className="text-xs leading-5 text-gray-400">
@@ -520,15 +427,15 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
                   <p className="mt-1 text-xs font-medium text-gray-400">备注：{account.remark}</p>
                 )}
                 <div className="flex flex-wrap gap-2">
-                   {blockedState && <span className="status-badge bg-red-100 text-red-700">{blockedState.verification_type === 'slider' ? '滑块验证' : blockedState.verification_type === 'face' ? '人脸验证' : '平台风控'}{blockedState.blocked ? ` · ${Math.max(1, Math.ceil(blockedState.remaining_seconds / 60))} 分钟` : ''}</span>}
+                   {blockedState && <span className="status-badge bg-red-100 text-red-700">{blockedState.verification_type === 'slider' ? '滑块验证' : blockedState.verification_type === 'face' ? '人脸验证' : '平台风控'}{blockedState.verification_required ? ' · 等待人工' : blockedState.blocked ? ` · ${Math.max(1, Math.ceil(blockedState.remaining_seconds / 60))} 分钟` : ''}</span>}
                    {account.auto_confirm && <span className="status-badge status-badge-warning flex items-center gap-1.5"><MessageSquare className="w-3 h-3"/> 自动确认</span>}
                    {account.pause_duration > 0 && <span className="status-badge status-badge-info flex items-center gap-1.5"><Clock className="w-3 h-3"/> 暂停 {account.pause_duration} 分钟</span>}
                 </div>
                 {/* 登录态过期给出明确动作，只挂一个徽标用户不知道该做什么 */}
                 {account.runtime_state === 'need_relogin' && (
                   <p className="mt-2 rounded-md bg-red-50 px-3 py-2 text-xs leading-5 text-red-700">
-                    闲鱼登录态已过期，人机验证和等待都无法恢复。请点右上角「扫码添加账号」
-                    用同一个闲鱼账号重新扫码，即可覆盖并恢复该账号。
+                    闲鱼登录态已过期，请打开下方原生浏览器重新登录
+                    使用同一个闲鱼账号登录，捕获网页 Token 后确认恢复。
                   </p>
                 )}
 
@@ -591,102 +498,16 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
         {accounts.length === 0 && (
             <EmptyState
               title="暂无闲鱼账号"
-              description="扫码登录后，系统会保存授权并开始获取账号资料、商品、消息和订单状态。"
+              description="在原生浏览器登录闲鱼并打开消息页，系统会自动捕获 Cookie 和消息 Token，添加账号。"
               icon={User}
               action={(
-                <button type="button" onClick={startQRLogin} className="ios-btn-primary rounded-md px-4 py-2 text-sm">
-                  扫码添加账号
+                <button type="button" disabled={!isAdmin} onClick={startBrowserLogin} className="ios-btn-primary rounded-md px-4 py-2 text-sm">
+                  浏览器添加账号
                 </button>
               )}
             />
         )}
       </div>
-
-      {/* QR Code Modal */}
-      {showQRModal && createPortal(
-          <div className="modal-overlay">
-              <div className="modal-container" style={{maxWidth: '24rem'}}>
-                  <div className="modal-header flex items-start justify-between gap-4">
-                    <div>
-                      <h3 className="text-lg font-bold text-gray-900">扫码登录</h3>
-                      <p className="mt-1 text-xs text-gray-500">使用闲鱼 App 扫码并在手机端确认。</p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={closeQRModal}
-                      className="rounded-md p-2 hover:bg-gray-100"
-                      aria-label="关闭扫码登录"
-                    >
-                      <X className="h-5 w-5 text-gray-600" />
-                    </button>
-                  </div>
-
-                  <div className="modal-body py-5">
-                      <div className="text-center">
-                          <div className="media-light-surface relative mx-auto flex h-60 w-60 items-center justify-center overflow-hidden rounded-md border border-gray-200 bg-gray-50">
-                              {qrStatus === 'loading' && <Loader2 className="h-9 w-9 animate-spin text-amber-500" />}
-                              {(qrStatus === 'waiting' || qrStatus === 'scanned') && (
-                                  <img src={qrCodeUrl} alt="闲鱼登录二维码" className="h-full w-full p-2" />
-                              )}
-                              {qrStatus === 'scanned' && (
-                                  <div className="absolute inset-x-3 bottom-3 border border-gray-200 bg-white/95 px-3 py-2 text-sm font-semibold text-gray-800">
-                                      已扫码，请在手机确认
-                                  </div>
-                              )}
-                              {qrStatus === 'processing' && (
-                                  <div className="absolute inset-0 flex flex-col items-center justify-center bg-white/95 text-gray-800">
-                                      <Loader2 className="mb-4 h-9 w-9 animate-spin text-amber-500" />
-                                      <span className="font-bold">正在准备账号</span>
-                                      <span className="mt-2 text-xs text-gray-500">无需重复扫码</span>
-                                  </div>
-                              )}
-                              {qrStatus === 'success' && (
-                                  <div className="absolute inset-0 flex animate-fade-in flex-col items-center justify-center bg-white/95 text-green-700">
-                                      <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-md bg-green-50">
-                                         <Check className="h-7 w-7" />
-                                      </div>
-                                      <span className="text-base font-bold">登录成功</span>
-                                  </div>
-                              )}
-                              {qrStatus === 'verification_required' && (
-                                  <div className="flex h-full w-full flex-col items-center justify-center bg-white p-2 text-center">
-                                      {verificationQrUrl ? (
-                                        <img src={verificationQrUrl} alt="闲鱼人脸验证二维码" className="h-44 w-44" />
-                                      ) : (
-                                        <ShieldCheck className="mb-3 h-12 w-12 text-amber-600" />
-                                      )}
-                                      <span className="mt-1 text-sm font-bold text-amber-800">手机扫码完成人脸验证</span>
-                                      <span className="mt-1 text-xs text-gray-500">验证通过后本页会自动继续，请勿关闭</span>
-                                      {verificationUrl && (
-                                        <a href={verificationUrl} target="_blank" rel="noreferrer" className="mt-2 text-xs text-blue-600 underline">在当前设备打开验证页</a>
-                                      )}
-                                  </div>
-                              )}
-                              {qrStatus === 'error' && (
-                                  <div className="flex flex-col items-center px-4 text-center">
-                                      <span className="mb-2 font-bold text-red-600">账号未登录完成</span>
-                                      {qrMessage && <span className="mb-3 text-xs text-gray-500">{qrMessage}</span>}
-                                      <button
-                                        type="button"
-                                        onClick={startQRLogin}
-                                        className="ios-btn-secondary flex items-center gap-1.5 rounded-md px-3 py-2 text-xs"
-                                      >
-                                        <RefreshCw className="h-3.5 w-3.5" />
-                                        重新生成
-                                      </button>
-                                  </div>
-                              )}
-                          </div>
-
-                          <p className="mt-4 rounded-md border border-gray-200 bg-gray-50 px-3 py-2 text-xs font-medium text-gray-500">
-                            {qrMessage || '二维码有效期为5分钟，请尽快扫码。'}
-                          </p>
-                      </div>
-                  </div>
-              </div>
-          </div>,
-          document.body
-      )}
 
       {/* 编辑账号弹窗 */}
       {activeModal === 'edit' && editingAccount && createPortal(
@@ -1010,6 +831,9 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
         </div>,
         document.body
       )}
+
+      {addingAccount && <AccountBrowser initialWindow={setupWindowRef.current}
+        onClose={() => setAddingAccount(false)} onChanged={() => void loadAccounts({ silent: true })} />}
 
       {browserAccount && <AccountBrowser account={browserAccount}
         onClose={() => setBrowserAccount(null)}

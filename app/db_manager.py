@@ -2119,6 +2119,21 @@ class DBManager:
         return cursor.executemany(sql, params_list)
     
     # -------------------- Cookie操作 --------------------
+    def create_browser_account(self, account_id: str, cookies: str, user_id: int):
+        """Create the single browser account atomically; never overwrite an existing account."""
+        with self.lock:
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT 1 FROM cookies LIMIT 1')
+            if cursor.fetchone():
+                raise ValueError('单账号模式下已有账号，请使用现有账号的浏览器入口')
+            try:
+                cursor.execute('INSERT INTO cookies (id, value, user_id) VALUES (?, ?, ?)',
+                               (account_id, cookies, user_id))
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
     def save_cookie(self, cookie_id: str, cookie_value: str, user_id: int = None) -> bool:
         """保存Cookie到数据库，如存在则更新"""
         with self.lock:

@@ -63,6 +63,13 @@ class CookieTaskLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNot(restarted, completed)
         self.assertEqual(self.manager.get_task_state("account-1"), "running")
 
+    async def test_waiting_browser_token_is_not_reported_as_running(self):
+        from types import SimpleNamespace
+        await self.manager._ensure_cookie_task_async('account-1', 'cookie')
+        self.manager.instances['account-1'] = SimpleNamespace(
+            last_token_refresh_status='waiting_browser_token', connection_state='disconnected')
+        self.assertEqual(self.manager.get_task_state('account-1'), 'waiting_browser')
+
     async def test_takeover_prevents_automatic_restart_until_explicit_resume(self):
         original = await self.manager._ensure_cookie_task_async('account-1', 'old')
         await self.manager.pause_cookie_task('account-1')

@@ -11,7 +11,7 @@ from utils import browser_limit
 import websockets
 from utils.xianyu_utils import (
     decrypt, generate_mid, generate_uuid, trans_cookies,
-    generate_device_id, generate_sign, CAPTCHA_CHALLENGE_COOKIES
+    generate_device_id, generate_sign
 )
 from app.config import (
     WEBSOCKET_URL, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT,
@@ -850,7 +850,6 @@ class XianyuLive:
 
         # 滑块验证相关
         self.captcha_verification_count = 0  # 滑块验证次数计数器
-        self.max_captcha_verification_count = 3  # 最大滑块验证次数，防止无限递归
         self.manual_captcha_in_progress = False  # 人工滑块验证进行中标志，暂停自动验证避免争抢浏览器槽位
 
         # WebSocket连接监控
@@ -2067,751 +2066,53 @@ class XianyuLive:
 
 
 
-    async def refresh_token(self, captcha_retry_count: int = 0):
-        """刷新token
-
-        Args:
-            captcha_retry_count: 滑块验证重试次数，用于防止无限递归
-        """
-        # 初始化通知发送标志，避免重复发送通知
-        notification_sent = False
-        # 本轮是否已经记过一次风控熔断。滑块失败分支和后面基于 ret 的通用分支
-        # 都会 trip()，同一次失败记两次会让冷却阶梯跳级、账号被多锁一倍时间。
-        already_tripped = False
-        
-        try:
-            logger.info(f"【{self.cookie_id}】开始刷新token... (滑块验证重试次数: {captcha_retry_count})")
-            # 标记本次刷新状态
-            self.last_token_refresh_status = "started"
-            # 重置“刷新流程内已重启”标记，避免多次重启
-            self.restarted_in_browser_refresh = False
-
-            # 风控冷却期内不再尝试刷新 —— 持续请求会让风控一直不解除
-            from utils import risk_control
-            guard = risk_control.registry.get(self.cookie_id)
-            if guard.is_blocked:
-                logger.warning(
-                    f"【{self.cookie_id}】处于风控冷却期（剩余 {guard.remaining_seconds} 秒），"
-                    f"跳过本次 Token 刷新"
-                )
-                self.last_token_refresh_status = "risk_control_blocked"
-                return None
-
-            # 人工验证进行中时跳过自动 Token 刷新 —— 自动滑块和人工验证共用
-            # browser_limit 全局信号量（默认 3 槽位），自动滑块占满槽位后人工验证
-            # 会在 launch_browser 里等 300 秒超时，前端弹窗卡在白屏 loading。
-            if getattr(self, 'manual_captcha_in_progress', False):
-                logger.info(f"【{self.cookie_id}】人工滑块验证进行中，跳过本次自动 Token 刷新")
-                self.last_token_refresh_status = "skipped_manual_captcha"
-                return None
-
-            # 检查滑块验证重试次数，防止无限递归
-            if captcha_retry_count >= self.max_captcha_verification_count:
-                logger.error(f"【{self.cookie_id}】滑块验证重试次数已达上限 ({self.max_captcha_verification_count})，停止重试")
-                await self.send_token_refresh_notification(
-                    f"滑块验证重试次数已达上限，请手动处理",
-                    "captcha_max_retries_exceeded"
-                )
-                notification_sent = True
-                return None
-
-            # 【消息接收检查】检查是否在消息接收后的冷却时间内，与 cookie_refresh_loop 保持一致
-            current_time = time.time()
-            time_since_last_message = current_time - self.last_message_received_time
-            if self.last_message_received_time > 0 and time_since_last_message < self.message_cookie_refresh_cooldown:
-                remaining_time = self.message_cookie_refresh_cooldown - time_since_last_message
-                remaining_minutes = int(remaining_time // 60)
-                remaining_seconds = int(remaining_time % 60)
-                logger.info(f"【{self.cookie_id}】收到消息后冷却中，放弃本次token刷新，还需等待 {remaining_minutes}分{remaining_seconds}秒")
-                # 标记为因冷却而跳过（正常情况）
-                self.last_token_refresh_status = "skipped_cooldown"
-                return None
-
-            # 【重要】在刷新token前，先从数据库重新加载最新的cookie
-            # 这样即使用户已经手动更新了cookie，代码也会使用最新的cookie
-            logger.info(f"【{self.cookie_id}】开始执行Cookie刷新任务...")
-            # await self._execute_cookie_refresh(time.time())
-            try:
-                from app.db_manager import db_manager
-                # 必须走线程池。db_manager 是同步 SQLite 且带全局锁，直接在事件
-                # 循环里调用会把整个循环卡住 —— 此时 HTTP 线程通过
-                # run_coroutine_threadsafe 提交的删除、更新等操作永远得不到调度，
-                # 表现为「点删除账号没反应，最后报超时」。
-                account_info = await asyncio.to_thread(
-                    db_manager.get_cookie_details, self.cookie_id
-                )
-                if account_info and account_info.get('cookie_value'):
-                    new_cookies_str = account_info.get('cookie_value')
-                    if new_cookies_str != self.cookies_str:
-                        logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
-                        self.cookies_str = new_cookies_str
-                        # 更新cookies字典
-                        self.cookies = trans_cookies(self.cookies_str)
-                        logger.warning(f"【{self.cookie_id}】Cookie已从数据库重新加载")
-            except Exception as reload_e:
-                logger.warning(f"【{self.cookie_id}】从数据库重新加载cookie失败，继续使用当前cookie: {self._safe_str(reload_e)}")
-
-            # 生成更精确的时间戳
-            timestamp = str(int(time.time() * 1000))
-
-            params = {
-                'jsv': '2.7.2',
-                'appKey': '34839810',
-                't': timestamp,
-                'sign': '',
-                'v': '1.0',
-                'type': 'originaljson',
-                'accountSite': 'xianyu',
-                'dataType': 'json',
-                'timeout': '20000',
-                'api': 'mtop.taobao.idlemessage.pc.login.token',
-                'sessionOption': 'AutoLoginOnly',
-                'dangerouslySetWindvaneParams': '%5Bobject%20Object%5D',
-                'smToken': 'token',
-                'queryToken': 'sm',
-                'sm': 'sm',
-                'spm_cnt': 'a21ybx.im.0.0',
-                'spm_pre': 'a21ybx.home.sidebar.1.4c053da6vYwnmf',
-                'log_id': '4c053da6vYwnmf'
-            }
-            data_val = '{"appKey":"444e9908a51d1cb236a27862abc769c9","deviceId":"' + self.device_id + '"}'
-            data = {
-                'data': data_val,
-            }
-
-            # 获取token
-            token = None
-            token = trans_cookies(self.cookies_str).get('_m_h5_tk', '').split('_')[0] if trans_cookies(self.cookies_str).get('_m_h5_tk') else ''
-
-            sign = generate_sign(params['t'], token, data_val)
-            params['sign'] = sign
-
-            # 发送请求 - 使用与浏览器完全一致的请求头
-            headers = {
-                'accept': 'application/json',
-                'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                'cache-control': 'no-cache',
-                'content-type': 'application/x-www-form-urlencoded',
-                'pragma': 'no-cache',
-                'priority': 'u=1, i',
-                'sec-ch-ua': SEC_CH_UA,
-                'sec-ch-ua-mobile': '?0',
-                'sec-ch-ua-platform': '"Windows"',
-                'sec-fetch-dest': 'empty',
-                'sec-fetch-mode': 'cors',
-                'sec-fetch-site': 'same-site',
-                'user-agent': CHROME_UA,
-                'referer': 'https://www.goofish.com/',
-                'origin': 'https://www.goofish.com',
-                'cookie': self.cookies_str
-            }
-
-            api_url = API_ENDPOINTS.get('token')
-            cookie_dict = trans_cookies(self.cookies_str)
-            logger.info(
-                f"【{self.cookie_id}】Token刷新请求: endpoint={api_url}, method=POST, "
-                f"cookie_fields={len(cookie_dict)}, cookie_length={len(self.cookies_str)}, "
-                f"token_present={bool(token)}, token_length={len(token)}, "
-                f"payload_length={len(data_val)}"
-            )
-
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    api_url,
-                    params=params,
-                    data=data,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as response:
-                    logger.info(
-                        f"【{self.cookie_id}】Token刷新响应: status={response.status}, "
-                        f"content_type={response.headers.get('content-type', 'unknown')}"
-                    )
-                    
-                    res_json = await response.json()
-                    response_keys = sorted(res_json.keys()) if isinstance(res_json, dict) else []
-                    response_data = res_json.get("data") if isinstance(res_json, dict) else None
-                    data_keys = sorted(response_data.keys()) if isinstance(response_data, dict) else []
-                    # ret 是闲鱼说明失败原因的唯一字段（TOKEN 过期、未登录、风控拦截
-                    # 各有不同取值）。原先只记结构不记 ret，日志里只能看到
-                    # 「data_keys=[] / Token获取失败」，等于把唯一的线索丢了。
-                    response_ret = res_json.get("ret") if isinstance(res_json, dict) else None
-                    logger.info(
-                        f"【{self.cookie_id}】Token刷新响应结构: "
-                        f"type={type(res_json).__name__}, keys={response_keys}, "
-                        f"data_keys={data_keys}, ret={response_ret}, "
-                        f"has_access_token={isinstance(response_data, dict) and bool(response_data.get('accessToken'))}"
-                    )
-                    logger.info(f"【{self.cookie_id}】================================")
-
-                    # 检查并更新Cookie
-                    if 'set-cookie' in response.headers:
-                        new_cookies = {}
-                        for cookie in response.headers.getall('set-cookie', []):
-                            if '=' in cookie:
-                                name, value = cookie.split(';')[0].split('=', 1)
-                                new_cookies[name.strip()] = value.strip()
-
-                        # 更新cookies
-                        if new_cookies:
-                            self.cookies.update(new_cookies)
-                            # 生成新的cookie字符串
-                            self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                            # 更新数据库中的Cookie
-                            await self.update_config_cookies()
-                            logger.warning("已更新Cookie到数据库")
-
-                    if isinstance(res_json, dict):
-                        ret_value = res_json.get('ret', [])
-                        # 检查ret是否包含成功信息
-                        if any('SUCCESS::调用成功' in ret for ret in ret_value):
-                            if 'data' in res_json and 'accessToken' in res_json['data']:
-                                new_token = res_json['data']['accessToken']
-                                self.current_token = new_token
-                                self.last_token_refresh_time = time.time()
-
-                                # 【消息接收时间重置】Token刷新成功后重置消息接收标志，与 cookie_refresh_loop 保持一致
-                                self.last_message_received_time = 0
-                                logger.warning(f"【{self.cookie_id}】Token刷新成功，已重置消息接收时间标识")
-
-                                logger.info(f"【{self.cookie_id}】Token刷新成功")
-                                # 标记为成功
-                                self.last_token_refresh_status = "success"
-                                # 拿到有效 token 就说明登录态是活的，必须清掉
-                                # 「需重新扫码」终态标记。它曾经只置不清，于是账号
-                                # 明明已经连上、订单和消息都在同步，界面还一直挂着
-                                # 「需重新扫码」，把用户引去做一次没必要的扫码。
-                                if self.needs_relogin:
-                                    logger.info(
-                                        f"【{self.cookie_id}】登录态已恢复，"
-                                        f"清除「需重新扫码」标记"
-                                    )
-                                self.needs_relogin = False
-                                self.relogin_reason = ''
-                                risk_control.registry.get(self.cookie_id).reset()
-                                return new_token
-
-                    # 检查是否需要滑块验证
-                    if self._need_captcha_verification(res_json):
-                        logger.warning(f"【{self.cookie_id}】检测到需要滑块验证，开始处理...")
-
-                        # 记录滑块验证检测到日志文件
-                        verification_url = res_json.get('data', {}).get('url', 'Token刷新时检测')
-                        log_captcha_event(self.cookie_id, "检测到滑块验证", None, f"触发场景: Token刷新, URL: {verification_url}")
-
-                        # 添加风控日志记录
-                        log_id = None
-                        try:
-                            from app.db_manager import db_manager
-                            success = db_manager.add_risk_control_log(
-                                cookie_id=self.cookie_id,
-                                event_type='slider_captcha',
-                                event_description=f"检测到需要滑块验证，触发场景: Token刷新, URL: {verification_url}",
-                                processing_status='processing'
-                            )
-                            if success:
-                                # 获取刚插入的记录ID（简单方式，实际应该返回ID）
-                                logs = db_manager.get_risk_control_logs(cookie_id=self.cookie_id, limit=1)
-                                if logs:
-                                    log_id = logs[0].get('id')
-                                logger.info(f"【{self.cookie_id}】风控日志记录成功，ID: {log_id}")
-                        except Exception as log_e:
-                            logger.error(f"【{self.cookie_id}】记录风控日志失败: {log_e}")
-
-                        try:
-                            # 尝试通过滑块验证获取新的cookies
-                            captcha_start_time = time.time()
-                            new_cookies_str = await self._handle_captcha_verification(res_json)
-                            captcha_duration = time.time() - captcha_start_time
-
-                            if new_cookies_str:
-                                logger.info(f"【{self.cookie_id}】滑块验证成功，准备重启实例...")
-
-                                # 更新风控日志为成功状态
-                                if 'log_id' in locals() and log_id:
-                                    try:
-                                        from app.db_manager import db_manager
-                                        db_manager.update_risk_control_log(
-                                            log_id=log_id,
-                                            processing_result=f"滑块验证成功，耗时: {captcha_duration:.2f}秒, cookies长度: {len(new_cookies_str)}",
-                                            processing_status='success'
-                                        )
-                                    except Exception as update_e:
-                                        logger.error(f"【{self.cookie_id}】更新风控日志失败: {update_e}")
-
-                                # 重启实例（cookies已在_handle_captcha_verification中更新到数据库）
-                                # await self._restart_instance()
-                                
-                                # 重新尝试刷新token（递归调用，但有深度限制）
-                                return await self.refresh_token(captcha_retry_count + 1)
-                            else:
-                                logger.error(f"【{self.cookie_id}】滑块验证失败")
-
-                                # 自动验证失败后立即熔断。实测滑块虽被拖到目标位置，
-                                # 服务端仍判定失败（行为特征识别），继续自动重试不会成功，
-                                # 只会让风控持续更久 —— 此时应转人工处理。
-                                risk_control.registry.get(self.cookie_id).trip(
-                                    "滑块自动验证失败，需人工处理"
-                                )
-                                # 本轮已经熔断过，后面基于 ret 的通用风控分支不要再记一次：
-                                # 同一次失败连续 trip 两次会让冷却阶梯跳级
-                                # （300 秒直接跳到 600 秒），账号被多锁一倍时间。
-                                already_tripped = True
-
-                                # 更新风控日志为失败状态
-                                if 'log_id' in locals() and log_id:
-                                    try:
-                                        from app.db_manager import db_manager
-                                        db_manager.update_risk_control_log(
-                                            log_id=log_id,
-                                            processing_result=f"滑块验证失败，耗时: {captcha_duration:.2f}秒, 原因: {self.last_captcha_failure}",
-                                            processing_status='failed'
-                                        )
-                                    except Exception as update_e:
-                                        logger.error(f"【{self.cookie_id}】更新风控日志失败: {update_e}")
-                                
-                                # 标记已发送通知（通知已在_handle_captcha_verification中发送）
-                                notification_sent = True
-
-                                # 自动验证已无望，给出可操作的人工处理指引。
-                                # 滑块被拖到目标位置仍被判失败时，重试再多次也不会通过。
-                                try:
-                                    await self.send_token_refresh_notification(
-                                        "滑块自动验证失败，需要人工处理\n\n"
-                                        "处理方式（任选其一）：\n"
-                                        "1. 在账号管理页重新扫码登录（最直接）\n"
-                                        "2. 用浏览器登录 www.goofish.com 手动完成验证后更新 Cookie\n\n"
-                                        "系统已暂停该账号的自动请求，避免风控加重。",
-                                        "captcha_manual_required",
-                                    )
-                                except Exception as notify_error:
-                                    logger.warning(
-                                        f"【{self.cookie_id}】发送人工处理通知失败: "
-                                        f"{self._safe_str(notify_error)}"
-                                    )
-                        except Exception as captcha_e:
-                            logger.error(f"【{self.cookie_id}】滑块验证处理异常: {self._safe_str(captcha_e)}")
-
-                            # 更新风控日志为异常状态
-                            captcha_duration = time.time() - captcha_start_time if 'captcha_start_time' in locals() else 0
-                            if 'log_id' in locals() and log_id:
-                                try:
-                                    from app.db_manager import db_manager
-                                    db_manager.update_risk_control_log(
-                                        log_id=log_id,
-                                        processing_result=f"滑块验证处理异常，耗时: {captcha_duration:.2f}秒",
-                                        processing_status='failed',
-                                        error_message=str(captcha_e)
-                                    )
-                                except Exception as update_e:
-                                    logger.error(f"【{self.cookie_id}】更新风控日志失败: {update_e}")
-                            
-                            # 标记已发送通知（通知已在_handle_captcha_verification中发送）
-                            notification_sent = True
-
-                    # 「令牌过期」和「Session过期」必须分开处理 —— 它们不是一回事：
-                    #
-                    #   FAIL_SYS_TOKEN_EXOIRED::令牌过期
-                    #       mtop 的签名令牌 _m_h5_tk 过时了。失败响应本身就会
-                    #       set-cookie 下发新令牌，重签一次即可，属可恢复。
-                    #   FAIL_SYS_SESSION_EXPIRED::Session过期
-                    #       登录会话（cookie2 / unb）真的死了，滑块和等待都救不回来，
-                    #       只能重新扫码。
-                    #
-                    # 原来一个 if 把两者一起打上「需重新扫码」终态，于是仅仅令牌
-                    # 过期也会让界面提示重扫；而实测紧接着的下一次刷新就返回
-                    # SUCCESS，账号完全正常。
-                    if isinstance(res_json, dict):
-                        res_json_str = json.dumps(res_json, ensure_ascii=False, separators=(',', ':'))
-                        session_expired = 'Session过期' in res_json_str
-                        token_expired = '令牌过期' in res_json_str
-
-                        if token_expired and not session_expired:
-                            # 令牌已随本次响应更新，直接带新令牌重试。必须递增计数：
-                            # 递归上限由 refresh_token 开头的
-                            # max_captcha_verification_count 统一把关。
-                            logger.warning(
-                                f"【{self.cookie_id}】签名令牌过期（可恢复），"
-                                f"带新令牌重试第 {captcha_retry_count + 1} 次"
-                            )
-                            return await self.refresh_token(captcha_retry_count + 1)
-
-                        if session_expired:
-                            # 调用统一的密码登录刷新方法
-                            refresh_success = await self._try_password_login_refresh("Session过期")
-
-                            if not refresh_success:
-                                # 会话过期和风控是两回事：滑块过了也救不回来，只能重新登录。
-                                # 打上终态标记，让界面能明确提示"请重新扫码"，
-                                # 否则用户只看到「连接中/重连」，会一直等一个不会好的状态。
-                                self.needs_relogin = True
-                                self.relogin_reason = '闲鱼登录态已过期，请重新扫码登录'
-                                logger.error(
-                                    f"【{self.cookie_id}】登录态已过期且无法自动续期"
-                                    f"（未配置账号密码或密码登录失败），需要重新扫码登录"
-                                )
-                                # 标记已发送通知，避免重复通知
-                                notification_sent = True
-                                # 返回None，让调用者知道刷新失败
-                                return None
-                            else:
-                                self.needs_relogin = False
-                                self.relogin_reason = ''
-                                # 刷新成功后重新获取 token。必须递增计数，否则上限判断
-                                # 永远不成立，会形成无限递归重试并持续加剧平台风控。
-                                return await self.refresh_token(captcha_retry_count + 1)
-
-                    ret_value = res_json.get('ret', []) if isinstance(res_json, dict) else []
-                    logger.error(
-                        f"【{self.cookie_id}】Token刷新失败: status={response.status}, "
-                        f"ret={ret_value[:3]}, response_type={type(res_json).__name__}"
-                    )
-
-                    # 平台风控：立刻熔断，避免重试风暴反复触发验证
-                    if risk_control.is_risk_control_error(json.dumps(ret_value, ensure_ascii=False)):
-                        if not already_tripped:
-                            guard.trip(str(ret_value[:2]))
-                        self.last_token_refresh_status = "risk_control"
-                        return None
-
-                    # 清空当前token，确保下次重试时重新获取
-                    self.current_token = None
-
-                    # 只有在没有发送过通知的情况下才发送Token刷新失败通知
-                    # 并且WebSocket未连接时才发送（已连接说明只是暂时失败）
-                    if not notification_sent:
-                        # 检查WebSocket连接状态
-                        is_ws_connected = (
-                            self.connection_state == ConnectionState.CONNECTED and 
-                            self.ws and 
-                            not self.ws.closed
-                        )
-                        
-                        if is_ws_connected:
-                            logger.info(f"【{self.cookie_id}】WebSocket连接正常，Token刷新失败可能是暂时的，跳过失败通知")
-                        else:
-                            logger.warning(f"【{self.cookie_id}】WebSocket未连接，发送Token刷新失败通知")
-                            await self.send_token_refresh_notification(
-                                f"Token刷新失败: {ret_value[:3]}",
-                                "token_refresh_failed",
-                            )
-                    else:
-                        logger.info(f"【{self.cookie_id}】已发送滑块验证相关通知，跳过Token刷新失败通知")
-                    return None
-
-        except Exception as e:
-            logger.error(f"Token刷新异常: {self._safe_str(e)}")
-
-            # 清空当前token，确保下次重试时重新获取
+    async def refresh_token(self):
+        """Consume a website-issued Token; never issue a second Token request."""
+        from utils.account_browser.tokens import tokens
+        value = tokens.get(self.cookie_id, max_age=self.token_refresh_interval)
+        if not value or value.account != self.myid:
             self.current_token = None
-
-            # 只有在没有发送过通知的情况下才发送Token刷新异常通知
-            # 并且WebSocket未连接时才发送（已连接说明只是暂时失败）
-            if not notification_sent:
-                # 检查WebSocket连接状态
-                is_ws_connected = (
-                    self.connection_state == ConnectionState.CONNECTED and 
-                    self.ws and 
-                    not self.ws.closed
-                )
-                
-                if is_ws_connected:
-                    logger.info(f"【{self.cookie_id}】WebSocket连接正常，Token刷新异常可能是暂时的，跳过失败通知")
-                else:
-                    logger.warning(f"【{self.cookie_id}】WebSocket未连接，发送Token刷新异常通知")
-                    await self.send_token_refresh_notification(f"Token刷新异常: {str(e)}", "token_refresh_exception")
-            else:
-                logger.info(f"【{self.cookie_id}】已发送滑块验证相关通知，跳过Token刷新异常通知")
+            self.last_token_refresh_status = 'waiting_browser_token'
             return None
+        self.current_token = value.token
+        self.device_id = value.device_id
+        self.message_app_key = value.app_key
+        self.cookies_str = value.cookies
+        self.cookies = trans_cookies(value.cookies)
+        self.last_token_refresh_time = value.received_at
+        self.last_token_refresh_status = 'success'
+        self.needs_relogin = False
+        self.relogin_reason = ''
+        return value.token
 
     def _need_captcha_verification(self, res_json: dict) -> bool:
-        """检查响应是否需要滑块验证"""
-        try:
-            if not isinstance(res_json, dict):
-                return False
+        """Only explicit verification responses require manual intervention."""
+        if not isinstance(res_json, dict):
+            return False
+        ret = res_json.get('ret') or []
+        if isinstance(ret, str):
+            ret = [ret]
+        if any(str(value).split('::', 1)[0] == 'FAIL_SYS_USER_VALIDATE' for value in ret):
+            return True
+        data = res_json.get('data')
+        url = data.get('url', '') if isinstance(data, dict) else ''
+        return isinstance(url, str) and any(marker in url for marker in ('punish', 'captcha', 'validate'))
 
-            log_captcha_event(
-                self.cookie_id,
-                "检查滑块验证响应",
-                None,
-                f"响应字段: {sorted(res_json.keys())}",
+    async def _require_manual_verification(self):
+        """Stop automatic attempts; the account browser owns manual verification."""
+        from utils import risk_control
+        from app.db_manager import db_manager
+        reason = '闲鱼要求滑块验证，请打开账号浏览器完成人工验证并确认登录'
+        risk_control.registry.get(self.cookie_id).require_verification(reason)
+        self.last_token_refresh_status = 'manual_verification_required'
+        try:
+            db_manager.add_risk_control_log(
+                cookie_id=self.cookie_id, event_type='slider_captcha',
+                event_description=reason, processing_status='pending',
             )
-
-            # 检查返回的错误信息
-            ret_value = res_json.get('ret', [])
-            if not ret_value:
-                return False
-
-            # 检查是否包含需要验证的关键词
-            captcha_keywords = [
-                'FAIL_SYS_USER_VALIDATE',  # 用户验证失败
-                'RGV587_ERROR',            # 风控错误
-                '哎哟喂,被挤爆啦',          # 被挤爆了
-                '哎哟喂，被挤爆啦',         # 被挤爆了（中文逗号）
-                '挤爆了',                  # 挤爆了
-                '请稍后重试',              # 请稍后重试
-                'punish?x5secdata',        # 惩罚页面
-                'captcha',                 # 验证码
-            ]
-
-            error_msg = str(ret_value[0]) if ret_value else ''
-
-            # 检查错误信息是否包含需要验证的关键词
-            for keyword in captcha_keywords:
-                if keyword in error_msg:
-                    logger.info(f"【{self.cookie_id}】检测到需要滑块验证的关键词: {keyword}")
-                    return True
-
-            # 检查data字段中是否包含验证URL
-            data = res_json.get('data', {})
-            if isinstance(data, dict) and 'url' in data:
-                url = data.get('url', '')
-                if 'punish' in url or 'captcha' in url or 'validate' in url:
-                    logger.info(f"【{self.cookie_id}】检测到验证URL: {url}")
-                    return True
-
-            return False
-
-        except Exception as e:
-            logger.error(f"【{self.cookie_id}】检查是否需要滑块验证时出错: {self._safe_str(e)}")
-            return False
-
-    async def _handle_captcha_verification(self, res_json: dict) -> str:
-        """处理滑块验证，返回新的cookies字符串"""
-        self.last_captcha_failure = "[challenge_fetch] 未取得验证链接"
-        try:
-            logger.info(f"【{self.cookie_id}】开始处理滑块验证...")
-
-            # 获取验证URL
-            verification_url = None
-
-            # 从data字段获取URL
-            data = res_json.get('data', {})
-            if isinstance(data, dict) and 'url' in data:
-                verification_url = data.get('url')
-
-            # 如果没有找到URL，使用默认的验证页面
-            if not verification_url:
-                logger.info(f"【{self.cookie_id}】未找到验证URL，认为不需要滑块验证，返回正常")
-                return None
-
-            logger.info(f"【{self.cookie_id}】验证URL: {verification_url}")
-
-            # 使用滑块验证器（独立实例，解决并发冲突）
-            try:
-                # 使用集成的滑块验证方法（无需猴子补丁）
-                from utils.xianyu_slider_stealth import XianyuSliderStealth
-                logger.info(f"【{self.cookie_id}】XianyuSliderStealth导入成功，使用滑块验证")
-
-                # 创建独立的滑块验证实例（每个用户独立实例，避免并发冲突）
-                # headless 必须为 False：实测同一账号、同一轨迹下，
-                # 无头 0/2 通过，有头 1/3 通过且平台确认解除风控。
-                # Chrome 无头的 WebGL 渲染器、字体列表、navigator.plugins、
-                # 屏幕参数与有头差异巨大，会被阿里 nc 直接识破。
-                # 服务器无显示器时用 Xvfb 提供虚拟显示：
-                #   xvfb-run -a --server-args="-screen 0 1920x1080x24" python Start.py
-                slider_headless = os.getenv('SLIDER_HEADLESS', 'false').lower() == 'true'
-                slider_stealth = XianyuSliderStealth(
-                    user_id=f"{self.cookie_id}",
-                    enable_learning=True,  # 启用学习功能
-                    headless=slider_headless
-                )
-
-                # Do not use a ThreadPoolExecutor context here: cancellation would
-                # synchronously join its worker and freeze the entire asyncio loop.
-                verification_task = asyncio.create_task(asyncio.to_thread(
-                    slider_stealth.run, verification_url, self.cookies_str
-                ))
-                try:
-                    success, cookies = await asyncio.shield(verification_task)
-                except asyncio.CancelledError:
-                    slider_stealth.cancel_requested = True
-                    await asyncio.to_thread(slider_stealth._kill_browser_process)
-                    try:
-                        await asyncio.wait_for(asyncio.shield(verification_task), timeout=10)
-                    except asyncio.TimeoutError:
-                        logger.warning(f"【{self.cookie_id}】旧验证线程仍在清理，取消标记将阻止其继续验证")
-                    raise
-
-                self.last_captcha_failure = getattr(slider_stealth, 'failure_reason', '[slider] 自动验证未返回凭证')
-                if success and cookies:
-                    # 边界防御：只有 x5sec 才是通行凭证。x5secdata / x5sectag 是挑战
-                    # 标记，必然存在，不能拿它们当验证通过的证据 —— 否则会把一堆
-                    # 挑战 cookie 写回账号，token 刷新永远 FAIL_SYS_USER_VALIDATE。
-                    if 'x5sec' not in {k.lower() for k in cookies}:
-                        self.last_captcha_failure = '[cookie_collect] 返回 Cookie 缺少 x5sec'
-                        logger.error(
-                            f"【{self.cookie_id}】滑块返回的 cookie 中没有 x5sec，"
-                            f"视觉通过但服务端未放行，按失败处理。"
-                            f"已有key: {list(cookies.keys())}"
-                        )
-                        success = False
-                        cookies = None
-
-                if success and cookies:
-                    logger.info(f"【{self.cookie_id}】滑块验证成功，获取到新的cookies")
-
-                    # 只提取x5sec相关的cookie值进行更新
-                    updated_cookies = self.cookies.copy()  # 复制现有cookies
-                    new_cookie_count = 0
-                    updated_cookie_count = 0
-                    x5sec_cookies = {}
-
-                    # 筛选出x5相关的cookies（包括x5sec, x5step等）
-                    for cookie_name, cookie_value in cookies.items():
-                        cookie_name_lower = cookie_name.lower()
-                        if cookie_name_lower.startswith('x5') or 'x5sec' in cookie_name_lower:
-                            x5sec_cookies[cookie_name] = cookie_value
-
-                    logger.info(f"【{self.cookie_id}】找到{len(x5sec_cookies)}个x5相关cookies: {list(x5sec_cookies.keys())}")
-
-                    # 只更新x5相关的cookies
-                    for cookie_name, cookie_value in x5sec_cookies.items():
-                        if cookie_name in updated_cookies:
-                            if updated_cookies[cookie_name] != cookie_value:
-                                logger.warning(f"【{self.cookie_id}】更新x5 cookie: {cookie_name}")
-                                updated_cookies[cookie_name] = cookie_value
-                                updated_cookie_count += 1
-                            else:
-                                logger.warning(f"【{self.cookie_id}】x5 cookie值未变: {cookie_name}")
-                        else:
-                            logger.warning(f"【{self.cookie_id}】新增x5 cookie: {cookie_name}")
-                            updated_cookies[cookie_name] = cookie_value
-                            new_cookie_count += 1
-
-                    # 拿到 x5sec 就必须清掉挑战标记。x5secdata / x5sectag 表示"这个请求
-                    # 还有一道未完成的人机验证"，而 x5sec 才是通过凭证。
-                    # 原来只做新增和覆盖、从不删除，于是滑块过了以后 Cookie 里
-                    # x5sec 和旧的 x5secdata 同时存在 —— 闲鱼据此认为挑战仍未完成，
-                    # 继续返回 FAIL_SYS_USER_VALIDATE，表现为"滑块过了却一直用不了"。
-                    if 'x5sec' in {k.lower() for k in x5sec_cookies}:
-                        for stale in CAPTCHA_CHALLENGE_COOKIES:
-                            for name in [k for k in updated_cookies if k.lower() == stale]:
-                                # 本次滑块响应又下发了同名值时以新值为准，不要删
-                                if name not in x5sec_cookies:
-                                    updated_cookies.pop(name, None)
-                                    logger.warning(
-                                        f"【{self.cookie_id}】已清除过期的验证挑战标记: {name}"
-                                    )
-
-                    # 将合并后的cookies字典转换为字符串格式
-                    cookies_str = "; ".join([f"{k}={v}" for k, v in updated_cookies.items()])
-
-                    logger.info(f"【{self.cookie_id}】x5 Cookie更新完成: 新增{new_cookie_count}个, 更新{updated_cookie_count}个, 总计{len(updated_cookies)}个")
-
-                    # 自动更新数据库中的cookie
-                    try:
-                        # 备份原有cookies
-                        old_cookies_str = self.cookies_str
-                        old_cookies_dict = self.cookies.copy()
-
-                        # 更新当前实例的cookies（使用合并后的cookies）
-                        self.cookies_str = cookies_str
-                        self.cookies = updated_cookies
-
-                        # 更新数据库中的cookies
-                        await self.update_config_cookies()
-                        logger.info(f"【{self.cookie_id}】滑块验证成功后，数据库cookies已自动更新")
-
-                            
-                        log_captcha_event(self.cookie_id, "滑块验证成功并自动更新数据库", True,
-                            f"cookies长度: {len(cookies_str)}, 新增{new_cookie_count}个x5, 更新{updated_cookie_count}个x5, 总计{len(updated_cookies)}个cookie项, x5字段: {sorted(x5sec_cookies.keys())}")
-
-                        # 发送成功通知
-                        await self.send_token_refresh_notification(
-                            f"滑块验证成功，cookies已自动更新到数据库",
-                            "captcha_success_auto_update"
-                        )
-
-                    except Exception as update_e:
-                        logger.error(f"【{self.cookie_id}】自动更新数据库cookies失败: {self._safe_str(update_e)}")
-
-                        # 回滚cookies
-                        self.cookies_str = old_cookies_str
-                        self.cookies = old_cookies_dict
-
-                        log_captcha_event(self.cookie_id, "滑块验证成功但数据库更新失败", False,
-                            f"更新异常: {self._safe_str(update_e)[:100]}, x5字段: {sorted(x5sec_cookies.keys())}")
-
-                        # 发送更新失败通知
-                        await self.send_token_refresh_notification(
-                            f"滑块验证成功但数据库更新失败: {self._safe_str(update_e)}",
-                            "captcha_success_db_update_failed"
-                        )
-
-                    return cookies_str
-                else:
-                    logger.error(f"【{self.cookie_id}】滑块验证失败")
-
-                    # 记录滑块验证失败到日志文件
-                    log_captcha_event(self.cookie_id, "滑块验证失败", False,
-                        f"XianyuSliderStealth执行失败, 环境: {'Docker' if os.getenv('DOCKER_ENV') else '本地'}")
-
-                    # 发送通知（检查WebSocket连接状态）
-                    # 只有在WebSocket未连接时才发送通知，已连接说明可能是暂时性问题
-                    is_ws_connected = (
-                        self.connection_state == ConnectionState.CONNECTED and 
-                        self.ws and 
-                        not self.ws.closed
-                    )
-                    
-                    if is_ws_connected:
-                        logger.info(f"【{self.cookie_id}】WebSocket连接正常，滑块验证失败可能是暂时的，跳过通知")
-                    else:
-                        logger.warning(f"【{self.cookie_id}】WebSocket未连接，发送滑块验证失败通知")
-                        await self.send_token_refresh_notification(
-                            f"滑块验证失败，需要手动处理。验证URL: {verification_url}",
-                            "captcha_verification_failed"
-                        )
-                    return None
-
-            except ImportError as import_e:
-                self.last_captcha_failure = '[browser_start] 验证器依赖加载失败'
-                logger.error(f"【{self.cookie_id}】XianyuSliderStealth导入失败: {import_e}")
-                logger.error(f"【{self.cookie_id}】请安装Playwright库: pip install playwright")
-
-                # 记录导入失败到日志文件
-                log_captcha_event(self.cookie_id, "XianyuSliderStealth导入失败", False,
-                    f"Playwright未安装, 错误: {import_e}")
-
-                # 发送通知
-                await self.send_token_refresh_notification(
-                    f"滑块验证功能不可用，请安装Playwright。验证URL: {verification_url}",
-                    "captcha_dependency_missing"
-                )
-                return None
-
-            except Exception as stealth_e:
-                self.last_captcha_failure = f'[browser] 验证执行异常（{type(stealth_e).__name__}）'
-                logger.error(f"【{self.cookie_id}】滑块验证异常: {self._safe_str(stealth_e)}")
-
-                # 记录异常到日志文件
-                log_captcha_event(self.cookie_id, "滑块验证异常", False,
-                    f"执行异常, 错误: {self._safe_str(stealth_e)[:100]}")
-
-                # 发送通知（检查WebSocket连接状态）
-                # 只有在WebSocket未连接时才发送通知，已连接说明可能是暂时性问题
-                is_ws_connected = (
-                    self.connection_state == ConnectionState.CONNECTED and 
-                    self.ws and 
-                    not self.ws.closed
-                )
-                
-                if is_ws_connected:
-                    logger.info(f"【{self.cookie_id}】WebSocket连接正常，滑块验证执行异常可能是暂时的，跳过通知")
-                else:
-                    logger.warning(f"【{self.cookie_id}】WebSocket未连接，发送滑块验证执行异常通知")
-                    await self.send_token_refresh_notification(
-                        f"滑块验证执行异常，需要手动处理。验证URL: {verification_url}",
-                        "captcha_execution_error"
-                    )
-                return None
-
-
-
-        except Exception as e:
-            logger.error(f"【{self.cookie_id}】处理滑块验证时出错: {self._safe_str(e)}")
-            return None
+            await self.send_token_refresh_notification(reason, 'captcha_manual_required')
+        except Exception as exc:
+            logger.warning(f'【{self.cookie_id}】记录人工验证提示失败: {type(exc).__name__}')
 
     async def _update_cookies_and_restart(self, new_cookies_str: str):
         """更新cookies并重启任务"""
@@ -6586,74 +5887,16 @@ class XianyuLive:
             return obj
 
     async def token_refresh_loop(self):
-        """Token刷新循环"""
-        try:
-            while True:
-                try:
-                    # 检查账号是否启用
-                    from app.cookie_manager import manager as cookie_manager
-                    if cookie_manager and not cookie_manager.get_cookie_status(self.cookie_id):
-                        logger.info(f"【{self.cookie_id}】账号已禁用，停止Token刷新循环")
-                        break
-
-                    current_time = time.time()
-                    if current_time - self.last_token_refresh_time >= self.token_refresh_interval:
-                        logger.info("Token即将过期，准备刷新...")
-                        new_token = await self.refresh_token()
-                        if new_token:
-                            logger.info(f"【{self.cookie_id}】Token刷新成功，将关闭WebSocket以使用新Token重连")
-                            
-                            # Token刷新成功后，需要关闭WebSocket连接，让它用新Token重新连接
-                            # 原因：WebSocket连接建立时使用的是旧Token，新Token需要重新建立连接才能生效
-                            # 注意：只关闭WebSocket，不重启整个实例（后台任务继续运行）
-                            
-                            # 关闭当前WebSocket连接
-                            if self.ws and not self.ws.closed:
-                                try:
-                                    logger.info(f"【{self.cookie_id}】关闭当前WebSocket连接以使用新Token重连...")
-                                    await self.ws.close()
-                                    logger.info(f"【{self.cookie_id}】WebSocket连接已关闭，将自动重连")
-                                except Exception as close_e:
-                                    logger.warning(f"【{self.cookie_id}】关闭WebSocket时出错: {self._safe_str(close_e)}")
-                            
-                            # 退出Token刷新循环，让main循环重新建立连接
-                            # 后台任务（心跳、清理等）继续运行
-                            logger.info(f"【{self.cookie_id}】Token刷新完成，WebSocket将使用新Token重新连接")
-                            break
-                        else:
-                            # 根据上一次刷新状态决定日志级别（冷却/已重启为正常情况）
-                            if getattr(self, 'last_token_refresh_status', None) in ("skipped_cooldown", "restarted_after_cookie_refresh"):
-                                logger.info(f"【{self.cookie_id}】Token刷新未执行或已重启（正常），将在{self.token_retry_interval // 60}分钟后重试")
-                            else:
-                                logger.error(f"【{self.cookie_id}】Token刷新失败，将在{self.token_retry_interval // 60}分钟后重试")
-
-                            # 清空当前token，确保下次重试时重新获取
-                            self.current_token = None
-
-                            # 发送Token刷新失败通知
-                            await self.send_token_refresh_notification("Token定时刷新失败，将自动重试", "token_scheduled_refresh_failed")
-                            await self._interruptible_sleep(self.token_retry_interval)
-                            continue
-                    await self._interruptible_sleep(60)
-                except asyncio.CancelledError:
-                    # 收到取消信号，立即退出循环
-                    logger.info(f"【{self.cookie_id}】Token刷新循环收到取消信号，准备退出")
-                    raise
-                except Exception as e:
-                    logger.error(f"Token刷新循环出错: {self._safe_str(e)}")
-                    # 出错后也等待1分钟再重试，使用可中断的sleep
-                    try:
-                        await self._interruptible_sleep(60)
-                    except asyncio.CancelledError:
-                        logger.info(f"【{self.cookie_id}】Token刷新循环在重试等待时收到取消信号，准备退出")
-                        raise
-        except asyncio.CancelledError:
-            # 确保CancelledError被正确传播
-            logger.info(f"【{self.cookie_id}】Token刷新循环已取消，正在退出...")
-            raise
-        finally:
-            # 确保任务能正常结束
-            logger.info(f"【{self.cookie_id}】Token刷新循环已退出")
+        """Observe new browser credentials, reconnecting only when they change."""
+        from utils.account_browser.tokens import tokens
+        while True:
+            await self._interruptible_sleep(5)
+            value = tokens.get(self.cookie_id, max_age=self.token_refresh_interval)
+            if not value or value.account != self.myid or value.token != self.current_token:
+                await self.refresh_token()
+                if self.ws and not self.ws.closed:
+                    await self.ws.close()
+                return
 
     async def create_chat(self, ws, toid, item_id='891198795482'):
         msg = {
@@ -6854,28 +6097,15 @@ class XianyuLive:
         return response
 
     async def init(self, ws):
-        # 如果没有token或者token过期，获取新token
-        token_refresh_attempted = False
-        if not self.current_token or (time.time() - self.last_token_refresh_time) >= self.token_refresh_interval:
-            logger.info(f"【{self.cookie_id}】获取初始token...")
-            token_refresh_attempted = True
-
-            await self.refresh_token()
-
+        await self.refresh_token()
         if not self.current_token:
-            logger.error("无法获取有效token，初始化失败")
-            # 只有在没有尝试刷新token的情况下才发送通知，避免与refresh_token中的通知重复
-            if not token_refresh_attempted:
-                await self.send_token_refresh_notification("初始化时无法获取有效Token", "token_init_failed")
-            else:
-                logger.info("由于刚刚尝试过token刷新，跳过重复的初始化失败通知")
-            raise Exception("Token获取失败")
+            raise RuntimeError('等待网页消息 Token，请在原生浏览器打开闲鱼消息页并确认')
 
         msg = {
             "lwp": "/reg",
             "headers": {
                 "cache-header": "app-key token ua wv",
-                "app-key": APP_CONFIG.get('app_key'),
+                "app-key": self.message_app_key,
                 "token": self.current_token,
                 "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 DingTalk(2.1.5) OS(Windows/10) Browser(Chrome/133.0.0.0) DingWeb/2.1.5 IMPaaS DingWeb/2.1.5",
                 "dt": "j",
@@ -6886,7 +6116,22 @@ class XianyuLive:
             }
         }
         await ws.send(json.dumps(msg))
-        await asyncio.sleep(1)
+        registration_mid = msg['headers']['mid']
+        async with asyncio.timeout(20):
+            while True:
+                response = json.loads(await ws.recv())
+                if not isinstance(response, dict):
+                    continue
+                if str((response.get('headers') or {}).get('mid', '')) == str(registration_mid):
+                    if str(response.get('code')) != '200':
+                        from utils.account_browser.tokens import tokens
+                        tokens.reject(self.cookie_id, self.current_token)
+                        self.current_token = None
+                        raise RuntimeError('消息服务拒绝网页 Token，请在原生网页刷新后重试')
+                    break
+                # Process unsolicited pushes during registration without dropping them.
+                await self.handle_heartbeat_response(response)
+                self._create_tracked_task(self._handle_message_with_semaphore(response, ws))
         current_time = int(time.time() * 1000)
         msg = {
             "lwp": "/r/SyncStatus/ackDiff",
@@ -10353,6 +9598,16 @@ class XianyuLive:
                         logger.info(f"【{self.cookie_id}】账号已禁用，停止主循环")
                         break
 
+                    from utils import risk_control
+                    if risk_control.registry.get(self.cookie_id).verification_required:
+                        await asyncio.sleep(5)
+                        continue
+
+                    if not await self.refresh_token():
+                        self._set_connection_state(ConnectionState.DISCONNECTED, '等待网页消息 Token')
+                        await asyncio.sleep(5)
+                        continue
+
                     headers = WEBSOCKET_HEADERS.copy()
                     headers['Cookie'] = self.cookies_str
 
@@ -10403,13 +9658,6 @@ class XianyuLive:
                                 tasks_started.append("暂停清理")
                             else:
                                 logger.info(f"【{self.cookie_id}】暂停记录清理任务已在运行，跳过启动")
-
-                            if not self.cookie_refresh_task or self.cookie_refresh_task.done():
-                                logger.info(f"【{self.cookie_id}】启动Cookie刷新任务...")
-                                self.cookie_refresh_task = asyncio.create_task(self.cookie_refresh_loop())
-                                tasks_started.append("Cookie刷新")
-                            else:
-                                logger.info(f"【{self.cookie_id}】Cookie刷新任务已在运行，跳过启动")
 
                             # 启动商品同步任务
                             if self.item_sync_enabled:
@@ -10549,54 +9797,11 @@ class XianyuLive:
                         # 更新连接状态为重连中
                         self._set_connection_state(ConnectionState.RECONNECTING, f"连接关闭，第{self.connection_failures}次重连")
 
-                    # 检查是否超过最大失败次数
                     if self.connection_failures >= self.max_connection_failures:
-                        self._set_connection_state(ConnectionState.FAILED, f"连续失败{self.max_connection_failures}次")
-                        logger.warning(f"【{self.cookie_id}】连续失败{self.max_connection_failures}次，尝试通过密码登录刷新Cookie...")
-                        
-                        try:
-                            # 调用统一的密码登录刷新方法
-                            refresh_success = await self._try_password_login_refresh(f"连续失败{self.max_connection_failures}次")
-                            
-                            if refresh_success:
-                                logger.info(f"【{self.cookie_id}】✅ 密码登录刷新成功，将重置失败计数并继续重连")
-                                # 重置失败计数，因为已经刷新了Cookie
-                                self.connection_failures = 0
-                                # 更新连接状态
-                                self._set_connection_state(ConnectionState.RECONNECTING, "Cookie已刷新，准备重连")
-                                # 短暂等待后继续重连循环
-                                await asyncio.sleep(2)
-                                continue
-                            else:
-                                logger.warning(f"【{self.cookie_id}】❌ 密码登录刷新失败，将重启实例...")
-                        except Exception as refresh_e:
-                            logger.error(f"【{self.cookie_id}】密码登录刷新过程异常: {self._safe_str(refresh_e)}")
-                            logger.warning(f"【{self.cookie_id}】将重启实例...")
-                        
-                        # 如果密码登录刷新失败或异常，则重启实例
-                        logger.error(f"【{self.cookie_id}】准备重启实例...")
-                        self.connection_failures = 0  # 重置失败计数
-                        
-                        # 先清理后台任务，避免与重启过程冲突
-                        logger.info(f"【{self.cookie_id}】重启前先清理后台任务...")
-                        try:
-                            await asyncio.wait_for(
-                                self._cancel_background_tasks(),
-                                timeout=8.0  # 给足够时间让任务响应
-                            )
-                            logger.info(f"【{self.cookie_id}】后台任务已清理完成")
-                        except asyncio.TimeoutError:
-                            logger.warning(f"【{self.cookie_id}】后台任务清理超时，强制继续重启")
-                        except Exception as cleanup_e:
-                            logger.error(f"【{self.cookie_id}】后台任务清理失败: {self._safe_str(cleanup_e)}")
-                        
-                        # 触发重启（不等待完成）
-                        await self._restart_instance()
-                        
-                        # ⚠️ 重要：_restart_instance() 已触发重启，0.5秒后当前任务会被取消
-                        # 不要在这里等待或执行其他操作，让任务自然退出
-                        logger.info(f"【{self.cookie_id}】重启请求已触发，主程序即将退出，新实例将自动启动")
-                        return  # 退出当前连接循环，等待被取消
+                        self.connection_failures = self.max_connection_failures
+                        self._set_connection_state(ConnectionState.FAILED, '消息连接连续失败，等待重连')
+                        # Network failures do not prove that the website Token is invalid.
+                        # Only a rejected registration invalidates it; never relogin here.
 
                     # 计算重试延迟
                     # 风控期间的失败通常报"Token获取失败"，错误文本里不含风控特征，

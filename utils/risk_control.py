@@ -9,8 +9,9 @@
 - **熔断**：命中风控特征后，该账号进入冷却期，期间拒绝一切主动请求，
   冷却时间按连续命中次数指数增长。
 - **限流**：令牌桶控制每个账号的请求速率，多账号并发时也不会突发。
+- **人工验证**：平台明确要求验证时持续拦截主动请求，只有 Token 确认后解除。
 
-两者都是进程内状态，重启后重置 —— 这是可接受的，因为重启本身会间隔较久。
+限流、冷却和人工验证等待均为进程内状态；重启后重新校验凭证。
 """
 
 import asyncio
@@ -51,6 +52,7 @@ class AccountGuard:
         self.rate_per_minute = max(1, rate_per_minute)
 
         # 熔断
+        self.verification_required = False
         self.blocked_until = 0.0
         self.consecutive_hits = 0
         self.last_hit_reason = ""
@@ -64,7 +66,7 @@ class AccountGuard:
 
     @property
     def is_blocked(self) -> bool:
-        return time.monotonic() < self.blocked_until
+        return self.verification_required or time.monotonic() < self.blocked_until
 
     @property
     def remaining_seconds(self) -> int:
@@ -83,8 +85,17 @@ class AccountGuard:
         )
         return cooldown
 
-    def reset(self) -> None:
+    def require_verification(self, reason: str) -> None:
+        self.verification_required = True
+        self.blocked_until = 0.0
+        self.last_hit_reason = reason
+        logger.warning(f'【{self.cookie_id}】等待人工验证，停止自动重试')
+
+    def reset(self, *, verified: bool = False) -> None:
         """请求成功，解除熔断计数。"""
+        if self.verification_required and not verified:
+            return
+        self.verification_required = False
         if self.consecutive_hits or self.blocked_until:
             logger.info(f"【{self.cookie_id}】风控状态已解除")
         self.consecutive_hits = 0
@@ -114,6 +125,7 @@ class AccountGuard:
         return {
             "cookie_id": self.cookie_id,
             "blocked": self.is_blocked,
+            "verification_required": self.verification_required,
             "remaining_seconds": self.remaining_seconds,
             "consecutive_hits": self.consecutive_hits,
             "reason": self.last_hit_reason,

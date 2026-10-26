@@ -69,6 +69,20 @@ class AccountGuardTests(unittest.TestCase):
         self.assertFalse(guard.is_blocked)
         self.assertEqual(guard.consecutive_hits, 0)
 
+    def test_manual_verification_does_not_expire_or_clear_on_unrelated_success(self):
+        from unittest.mock import patch
+        guard = AccountGuard('manual')
+        guard.require_verification('FAIL_SYS_USER_VALIDATE')
+        with patch('utils.risk_control.time.monotonic', return_value=10**12):
+            self.assertTrue(guard.is_blocked)
+            self.assertEqual(guard.remaining_seconds, 0)
+        guard.reset()
+        self.assertTrue(guard.is_blocked)
+        self.assertTrue(guard.snapshot()['verification_required'])
+        guard.reset(verified=True)
+        self.assertFalse(guard.is_blocked)
+        self.assertFalse(guard.verification_required)
+
     def test_rate_limit_paces_requests(self):
         """令牌用尽后必须等待，不能无限放行。"""
         guard = AccountGuard("acc", rate_per_minute=60)  # 每秒 1 个

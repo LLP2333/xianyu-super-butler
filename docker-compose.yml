@@ -5,16 +5,25 @@ services:
       dockerfile: Dockerfile
     image: xianyu-super-butler:latest
     container_name: xianyu-super-butler
+    stop_grace_period: 60s
     restart: unless-stopped
     user: "0:0"
     ports:
       - "${WEB_PORT:-8080}:8080"
     volumes:
+      # Full Docker management authority; enable only on a trusted self-hosted deployment.
+      - /var/run/docker.sock:/var/run/docker.sock
       - ./data:/app/data:rw
       - ./logs:/app/logs:rw
       - ./backups:/app/backups:rw
       - ./global_config.yml:/app/global_config.yml:ro
     environment:
+      ACCOUNT_BROWSER_IMAGE: "${ACCOUNT_BROWSER_IMAGE:-lscr.io/linuxserver/chrome:latest}"
+      ACCOUNT_BROWSER_NETWORK: "${ACCOUNT_BROWSER_NETWORK:-xianyu-browsers}"
+      ACCOUNT_BROWSER_CDP_CONFIG: "${ACCOUNT_BROWSER_CDP_CONFIG:-${PWD}/deploy/account-browser/cdp.conf}"
+      ACCOUNT_BROWSER_BIND: "${ACCOUNT_BROWSER_BIND:-127.0.0.1}"
+      ACCOUNT_BROWSER_API_URL: "http://xianyu-app:8080"
+      ACCOUNT_BROWSER_HOST: "${ACCOUNT_BROWSER_HOST:-localhost}"
       PYTHONUNBUFFERED: "${PYTHONUNBUFFERED:-1}"
       PYTHONDONTWRITEBYTECODE: "${PYTHONDONTWRITEBYTECODE:-1}"
       TZ: "${TZ:-Asia/Shanghai}"
@@ -50,6 +59,7 @@ services:
       MESSAGE_EXPIRE_TIME: "${MESSAGE_EXPIRE_TIME:-300000}"
     networks:
       - xianyu-network
+      - browser-network
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 30s
@@ -85,4 +95,9 @@ services:
 
 networks:
   xianyu-network:
+    driver: bridge
+
+  # Named explicitly so account containers can join the same network.
+  browser-network:
+    name: "${ACCOUNT_BROWSER_NETWORK:-xianyu-browsers}"
     driver: bridge

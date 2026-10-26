@@ -1,130 +1,99 @@
-"""Own persistent Chromium profiles; all methods run on the web server event loop."""
+"""Account-owned original LinuxServer desktops and read-only CDP connections."""
 import asyncio
-import hashlib
-import json
-import os
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
-from contextlib import suppress
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
+import aiohttp
 from playwright.async_api import async_playwright
-from utils.manual_captcha import _to_playwright_cookies
-from .desktop import Desktop
+
+from .containers import ContainerDesktop, ContainerPool
 
 
 @dataclass
 class AccountBrowser:
-    desktop: Desktop
-    context: object
-    playwright: object
-    database_cookie: str
-    profile: Path
+    desktop: ContainerDesktop
     owner_id: int
-    connected: bool = True
 
     @property
     def alive(self):
-        return self.connected and self.desktop.alive
+        return self.desktop.alive
 
-    async def page(self):
-        pages = self.context.pages
-        return pages[-1] if pages else await self.context.new_page()
-
-    async def checkpoint(self):
-        if not self.connected:
-            return
-        # Chromium may discard session cookies on clean exit; preserve them explicitly.
-        destination = self.profile / 'session-cookies.json'
-        temporary = destination.with_suffix('.tmp')
-        with temporary.open('w', encoding='utf-8') as output:
-            os.chmod(temporary, 0o600)
-            json.dump(await self.context.cookies(), output)
-        temporary.replace(destination)
-        (self.profile / '.initialized').write_text(hashlib.sha256(self.database_cookie.encode()).hexdigest())
+    @asynccontextmanager
+    async def connect(self):
+        """Attach temporarily, leaving LinuxServer's Chrome and profile alive on detach."""
+        async with aiohttp.ClientSession(auth=self.desktop.auth, timeout=aiohttp.ClientTimeout(total=10)) as client:
+            async with client.get(f'http://{self.desktop.host}:9223/json/version') as response:
+                response.raise_for_status()
+                payload = await response.json()
+        endpoint = urlsplit(payload['webSocketDebuggerUrl'])
+        endpoint = urlunsplit(('ws', f'{self.desktop.host}:9223', endpoint.path, '', ''))
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.connect_over_cdp(
+                endpoint, headers={'Authorization': self.desktop.auth.encode()}, timeout=15000)
+            if not browser.contexts:
+                raise RuntimeError('Chrome 尚未创建账号会话')
+            # Stopping Playwright only detaches CDP. Never close the native context.
+            yield browser.contexts[0]
 
     async def close(self):
-        try:
-            try:
-                await self.checkpoint()
-            finally:
-                await self.context.close()
-        finally:
-            try:
-                await self.playwright.stop()
-            finally:
-                await self.desktop.close()
+        # Let Chrome flush its profile before the desktop/compositor is stopped.
+        # CDP Browser.close is intentional here; browser.close() would only detach.
+        with suppress(Exception):
+            async with asyncio.timeout(8):
+                async with self.connect() as context:
+                    session = await context.browser.new_browser_cdp_session()
+                    await session.send('Browser.close')
+                await self.desktop.wait_for_chrome_exit()
+        await self.desktop.stop()
 
 
 class BrowserManager:
-    def __init__(self, root=None):
-        self.root = Path(root or Path(__file__).resolve().parents[2] / 'data' / 'browser_profiles')
+    def __init__(self, root=None, **pool_options):
+        root = root or Path(__file__).resolve().parents[2] / 'data' / 'account_browsers'
+        self.pool = ContainerPool(root, **pool_options)
         self.browsers = {}
         self.locks = {}
+        self.loaded = False
+        self.checked = set()
+        self.discovery_lock = asyncio.Lock()
 
     def lock(self, account_id):
         return self.locks.setdefault(account_id, asyncio.Lock())
 
-    def profile(self, account_id, owner_id):
-        # Database IDs are not filesystem paths, even if supplied by an API client.
-        return self.root / hashlib.sha256(f'{owner_id}:{account_id}'.encode()).hexdigest()
+    async def discover(self):
+        async with self.discovery_lock:
+            if not self.loaded:
+                for account_id, owner_id, desktop in await self.pool.discover():
+                    await desktop.refresh()
+                    self.browsers[account_id] = AccountBrowser(desktop, owner_id)
+                self.loaded = True
 
-    async def ensure(self, account_id, cookies, owner_id):
-        """Caller holds the account lock. Existing profiles are never reseeded on restart."""
+    async def ensure(self, account_id, owner_id):
+        """Caller owns the account lock. Chrome owns its cookies; never seed old ones."""
+        await self.discover()
         browser = self.browsers.get(account_id)
-        if browser and browser.alive and browser.owner_id == owner_id:
+        if (browser and account_id in self.checked and browser.owner_id == owner_id
+                and await browser.desktop.refresh()):
             return browser
         await self.stop(account_id)
-        profile = self.profile(account_id, owner_id)
-        profile.mkdir(parents=True, exist_ok=True, mode=0o700)
-        marker = profile / '.initialized'
-        desktop = Desktop()
-        playwright = context = None
-        try:
-            await desktop.start()
-            playwright = await async_playwright().start()
-            context = await playwright.chromium.launch_persistent_context(
-                str(profile), headless=False, channel='chromium', no_viewport=True,
-                env={**os.environ, 'DISPLAY': desktop.display},
-                args=['--no-sandbox', '--disable-dev-shm-usage', '--window-size=1280,900'],
-            )
-            checkpoint = profile / 'session-cookies.json'
-            if checkpoint.exists():
-                await context.add_cookies(json.loads(checkpoint.read_text()))
-            database_hash = hashlib.sha256(cookies.encode()).hexdigest()
-            if not marker.exists() or marker.read_text() != database_hash:
-                await context.add_cookies(_to_playwright_cookies(cookies))
-                marker.write_text(database_hash)
-            browser = AccountBrowser(desktop, context, playwright, cookies, profile, owner_id)
-            context.on('close', lambda *_: setattr(browser, 'connected', False))
-            page = await browser.page()
-            if page.url == 'about:blank':
-                # Navigation failures must not destroy the desktop: humans can reload it.
-                try:
-                    await page.goto('https://www.goofish.com/', wait_until='domcontentloaded', timeout=30000)
-                except Exception:
-                    pass
-            self.browsers[account_id] = browser
-            return browser
-        except BaseException:
-            try:
-                if context:
-                    with suppress(Exception):
-                        await context.close()
-                if playwright:
-                    with suppress(Exception):
-                        await playwright.stop()
-            finally:
-                await desktop.close()
-            raise
+        desktop = await self.pool.ensure(account_id, owner_id)
+        browser = AccountBrowser(desktop, owner_id)
+        self.browsers[account_id] = browser
+        self.checked.add(account_id)
+        return browser
 
     async def stop(self, account_id):
         browser = self.browsers.pop(account_id, None)
+        self.checked.discard(account_id)
         if browser:
             await browser.close()
 
     async def close(self):
-        for account_id in list(self.browsers):
+        async def stop_one(account_id):
             async with self.lock(account_id):
-                # One broken browser must not leak the remaining desktops on shutdown.
                 with suppress(Exception):
                     await self.stop(account_id)
+        await asyncio.gather(*(stop_one(account_id) for account_id in list(self.browsers)))
+        await self.pool.close()

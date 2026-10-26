@@ -1,13 +1,14 @@
-"""Account takeover, credential confirmation and browser reconciliation."""
+"""One native browser: onboarding, passive credentials, resume and explicit reset."""
 import asyncio
-from contextlib import suppress
-from urllib.parse import urlsplit
-
 from loguru import logger
 from utils.account_browser.manager import BrowserManager
-from utils.manual_captcha import request_manual_token, _from_playwright_cookies, _to_playwright_cookies
-from utils.xianyu_utils import trans_cookies, drop_stale_captcha_challenge
+from utils.account_browser.listener import TokenListener
+from utils.account_browser.tokens import tokens
+from utils.xianyu_utils import trans_cookies
 from utils import risk_control
+
+PRIMARY = 'primary'
+PENDING = 'browser-onboarding'
 
 
 class AccountBrowserService:
@@ -16,7 +17,10 @@ class AccountBrowserService:
         self.account_manager = account_manager
         self.browsers = browsers or BrowserManager()
         self.manual = set()
-        self.viewers = {}
+        self.listener = None
+        self.pending_owner = None
+        self.created_id = None
+        self.setup_error = None
         self.errors = {}
         self.task = None
 
@@ -24,147 +28,222 @@ class AccountBrowserService:
         record = self.db.get_cookie_details(account_id)
         if not record or record['user_id'] != user_id:
             raise LookupError('账号不存在或无权访问')
+        if len(self.db.get_all_cookies()) > 1:
+            raise ValueError('当前为单账号模式，请先保留一个账号')
         return record
 
-    async def disconnect(self, account_id):
-        viewer = self.viewers.pop(account_id, None)
-        if viewer:
-            socket, task = viewer
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            with suppress(Exception):
-                await socket.close(code=1000)
+    def desktop(self, user_id=None):
+        browser = self.browsers.browsers.get(PRIMARY)
+        if not browser or not browser.alive or (user_id is not None and browser.owner_id != user_id):
+            raise LookupError('浏览器未打开或无权访问')
+        return browser
 
-    async def takeover(self, account_id, user_id):
-        async with self.browsers.lock(account_id):
+    async def stop(self):
+        if self.listener:
+            await self.listener.close()
+            self.listener = None
+        await self.browsers.stop(PRIMARY)
+
+    async def ensure(self, owner, account_id=None, cookies=None):
+        browser = await self.browsers.ensure(PRIMARY, owner)
+        expected = trans_cookies(cookies).get('unb') if cookies else None
+        key = account_id or PENDING
+        if self.listener and (self.listener.browser is not browser or self.listener.account_id != key):
+            await self.listener.close()
+            self.listener = None
+        if self.listener is None:
+            self.listener = TokenListener(key, expected, browser, self.capture_new_account)
+        await self.listener.start()
+        return browser
+
+    async def setup(self, user_id):
+        async with self.browsers.lock(PRIMARY):
+            if self.db.get_all_cookies():
+                raise ValueError('当前为单账号模式，已有账号，请打开该账号的浏览器')
+            if self.pending_owner is not None and self.pending_owner != user_id:
+                raise ValueError('其他管理员正在添加账号')
+            existing = self.browsers.browsers.get(PRIMARY)
+            if existing and existing.owner_id != user_id:
+                raise ValueError('浏览器属于其他管理员，无法使用其登录资料')
+            self.pending_owner = user_id
+            self.created_id = None
+            self.setup_error = None
+            browser = await self.ensure(user_id)
+            return {'message': '请在原生浏览器登录闲鱼并打开消息页，系统会自动捕获 Cookie 和消息 Token 并添加账号。',
+                    'desktop_url': browser.desktop.desktop_url}
+
+    async def capture_new_account(self, value):
+        if self.pending_owner is None:
+            return
+        async with self.browsers.lock(PRIMARY):
+            if self.pending_owner is None or not self.listener or self.listener.account_id != PENDING:
+                return
+            try:
+                manager = self.account_manager()
+                if manager is None:
+                    raise RuntimeError('账号管理尚未就绪，请稍后刷新闲鱼消息页')
+                if not value.account.isdecimal():
+                    raise ValueError('网页账号身份无效，未保存')
+                # Request identity and current cookie identity were checked by the listener.
+                self.db.create_browser_account(value.account, value.cookies, self.pending_owner)
+                self.listener.account_id = value.account
+                self.listener.expected_account = value.account
+                tokens.clear(PENDING)
+                tokens.observe(value.account, value)
+                tokens.approve(value.account, value)
+                self.created_id = value.account
+                self.pending_owner = None
+                risk_control.registry.get(value.account).reset(verified=True)
+                await manager.resume_cookie_task(value.account, value.cookies)
+                self.setup_error = None
+            except Exception as exc:
+                if self.created_id:
+                    self.manual.add(self.created_id)
+                    tokens.pause(self.created_id)
+                self.setup_error = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else '账号保存或启动失败，请重试'
+
+    async def setup_status(self, user_id):
+        browser = self.desktop(user_id)
+        return {'account_id': self.created_id, 'message': self.setup_error or
+                ('账号已添加，消息连接结果请查看账号状态' if self.created_id else
+                 (self.listener.error if self.listener else None) or '等待你在闲鱼网页登录并打开消息页'),
+                'desktop_url': browser.desktop.desktop_url}
+
+    async def takeover(self, account_id, user_id, restart=False):
+        async with self.browsers.lock(PRIMARY):
             record = self.account(account_id, user_id)
             if not self.db.get_cookie_status(account_id):
                 raise ValueError('请先启用账号，再打开浏览器')
             manager = self.account_manager()
             if manager is None:
                 raise RuntimeError('账号管理尚未就绪')
-            first = account_id not in self.manual
-            try:
-                if first:
-                    self.manual.add(account_id)
-                    await manager.pause_cookie_task(account_id)
-                await self.browsers.ensure(account_id, record['value'], user_id)
-                self.errors.pop(account_id, None)
-            except BaseException:
-                if first:
-                    await manager.resume_cookie_task(account_id, record['value'])
-                    self.manual.discard(account_id)
-                raise
-            return {'manual': True, 'message': '已接管账号浏览器，自动任务已暂停。关闭窗口不会结束接管。'}
+            if account_id not in self.manual:
+                await manager.pause_cookie_task(account_id)
+                self.manual.add(account_id)
+                tokens.pause(account_id)
+            if restart:
+                await self.stop()
+            browser = await self.ensure(user_id, account_id, record['value'])
+            return {'manual': True, 'message': '监听已就绪。请在原生浏览器完成验证并打开或刷新闲鱼消息页。',
+                    'desktop_url': browser.desktop.desktop_url}
 
-    async def cookies(self, account_id):
-        from app.config import API_ENDPOINTS
-        browser = self.browsers.browsers[account_id]
-        return drop_stale_captcha_challenge(_from_playwright_cookies(
-            await browser.context.cookies([API_ENDPOINTS['token']])))
-
-    async def challenge(self, account_id, user_id):
-        async with self.browsers.lock(account_id):
-            record, browser = self.require_manual(account_id, user_id)
-            result = await request_manual_token(await self.cookies(account_id))
-            await browser.context.add_cookies(_to_playwright_cookies(result['cookies_str']))
-            if result['token']:
-                return {'message': '登录凭证可用，请点击“确认登录并恢复”'}
-            url = urlsplit(result['url'])
-            if url.scheme != 'https' or not any(
-                url.hostname == domain or (url.hostname or '').endswith('.' + domain)
-                for domain in ('goofish.com', 'taobao.com', 'alibaba.com', 'alicdn.com')
-            ):
-                raise ValueError(f"未取得可用验证链接：{result['reason']}。可在浏览器内登录或刷新页面。")
-            page = await browser.page()
-            await page.goto(result['url'], wait_until='domcontentloaded', timeout=30000)
-            await page.bring_to_front()
-            return {'message': '验证页已在当前浏览器中打开，完成后请确认登录并恢复'}
-
-    def require_manual(self, account_id, user_id):
+    async def status(self, account_id, user_id):
         record = self.account(account_id, user_id)
-        browser = self.browsers.browsers.get(account_id)
-        if account_id not in self.manual or not browser or not browser.alive:
-            raise ValueError('请先打开账号浏览器；若浏览器已退出，请重新连接')
-        return record, browser
+        listener = self.listener
+        connected = bool(listener and listener.account_id == account_id and listener.task and not listener.task.done() and listener.ready.is_set())
+        value = tokens.get(account_id, candidate=True)
+        return {'manual': account_id in self.manual, 'listening': connected,
+                'captured': bool(value and value.account == trans_cookies(record['value']).get('unb')),
+                'message': self.errors.get(account_id) or (listener.error if listener else None) or
+                ('已捕获网页消息 Token，可确认并恢复' if value else '等待网页消息 Token，请打开或刷新闲鱼消息页')}
 
     async def finish(self, account_id, user_id, save=True):
-        async with self.browsers.lock(account_id):
+        async with self.browsers.lock(PRIMARY):
             record = self.account(account_id, user_id)
             if account_id not in self.manual:
-                raise ValueError('账号当前未处于接管状态')
-            # End input before inspecting credentials, avoiding edits during Token confirmation.
-            await self.disconnect(account_id)
-            cookies = record['value']
-            if save:
-                _, browser = self.require_manual(account_id, user_id)
-                cookies = await self.cookies(account_id)
-                expected = trans_cookies(record['value']).get('unb')
-                actual = trans_cookies(cookies).get('unb')
-                if not expected or actual != expected:
-                    raise ValueError('浏览器登录的闲鱼账号与当前账号不一致，请登录原账号后重试')
-                result = await request_manual_token(cookies)
-                if not result['token']:
-                    raise ValueError(f"Token 确认失败：{result['reason']}，仍保持接管，可重新连接继续操作")
-                cookies = result['cookies_str']
-                if not self.db.update_cookie_account_info(account_id, cookie_value=cookies):
-                    raise RuntimeError('Cookie 保存失败，账号仍保持接管')
-                await browser.context.add_cookies(_to_playwright_cookies(cookies))
-                browser.database_cookie = cookies
-                risk_control.registry.get(account_id).reset()
+                raise ValueError('账号当前未处于人工操作状态')
             manager = self.account_manager()
             if manager is None:
-                raise RuntimeError('账号管理尚未就绪，账号仍保持接管')
-            await manager.resume_cookie_task(account_id, cookies)
+                raise RuntimeError('账号管理尚未就绪')
+            cookies = record['value']
+            if save:
+                expected = trans_cookies(cookies).get('unb')
+                if not self.listener or await self.listener.current_account() != expected:
+                    raise ValueError('请在原生浏览器登录当前账号，等待网页获取消息 Token')
+                value = tokens.get(account_id, candidate=True)
+                if not value or value.account != expected:
+                    raise ValueError('尚未捕获当前账号的有效网页 Token，请打开或刷新闲鱼消息页')
+                if not self.db.update_cookie_account_info(account_id, cookie_value=value.cookies):
+                    raise RuntimeError('登录状态保存失败，账号仍保持暂停')
+                cookies = value.cookies
+                tokens.approve(account_id, value)
+                risk_control.registry.get(account_id).reset(verified=True)
+            else:
+                tokens.resume(account_id)
+            try:
+                await manager.resume_cookie_task(account_id, cookies)
+            except BaseException:
+                tokens.pause(account_id)
+                raise
             self.manual.discard(account_id)
-            return {'message': 'Token 已确认，Cookie 已保存，账号任务已恢复' if save else '已结束接管，使用原凭证恢复账号任务'}
+            return {'message': '已采用网页 Token 并恢复账号任务，请查看消息连接状态' if save else '已结束操作，未更新登录状态；无可用 Token 时等待网页授权'}
+
+    async def clear(self, user_id):
+        async with self.browsers.lock(PRIMARY):
+            existing = self.browsers.browsers.get(PRIMARY)
+            if existing and existing.owner_id != user_id:
+                raise LookupError('无权清空其他管理员的浏览器')
+            records = self.db.get_all_cookies()
+            if len(records) > 1:
+                raise ValueError('当前为单账号模式，请先保留一个账号')
+            account_id = next(iter(records), None)
+            if account_id:
+                record = self.account(account_id, user_id)
+                manager = self.account_manager()
+                if manager is None:
+                    raise RuntimeError('账号管理尚未就绪')
+                await manager.pause_cookie_task(account_id)
+                self.manual.add(account_id)
+                identity = trans_cookies(record['value']).get('unb')
+                if not identity or not self.db.update_cookie_account_info(account_id, cookie_value=f'unb={identity}'):
+                    raise RuntimeError('登录凭证清除失败，未清空浏览器')
+                tokens.clear(account_id)
+            elif self.pending_owner not in (None, user_id):
+                raise LookupError('无权清空其他管理员的浏览器')
+            existing = self.browsers.browsers.get(PRIMARY)
+            if existing and existing.owner_id != user_id:
+                raise LookupError('无权清空其他管理员的浏览器')
+            await self.stop()
+            await self.browsers.pool.clear_profile(user_id)
+            self.created_id = None
+            self.setup_error = None
+            if account_id:
+                browser = await self.ensure(user_id, account_id, f'unb={identity}')
+            else:
+                self.pending_owner = user_id
+                browser = await self.ensure(user_id)
+            return {'message': '浏览器数据和旧登录凭证已清空，请重新登录；账号设置保留。',
+                    'desktop_url': browser.desktop.desktop_url}
 
     async def reconcile(self):
-        records = self.db.get_all_cookies()
-        for account_id in set(records) | set(self.browsers.browsers) | self.manual:
-            async with self.browsers.lock(account_id):
-                try:
-                    enabled = account_id in records and self.db.get_cookie_status(account_id)
-                    if not enabled:
-                        await self.disconnect(account_id)
-                        await self.browsers.stop(account_id)
-                        if account_id in self.manual:
-                            manager = self.account_manager()
-                            if manager:
-                                await manager.release_browser_pause(account_id)
-                            self.manual.discard(account_id)
-                        self.errors.pop(account_id, None)
-                        continue
-                    record = self.db.get_cookie_details(account_id)
-                    if not record:
-                        continue
-                    browser = await self.browsers.ensure(account_id, records[account_id], record['user_id'])
-                    if account_id not in self.manual and browser.database_cookie != records[account_id]:
-                        await browser.context.add_cookies(_to_playwright_cookies(records[account_id]))
-                        browser.database_cookie = records[account_id]
-                    await browser.checkpoint()
-                    self.errors.pop(account_id, None)
-                except Exception as exc:
-                    message = str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__
-                    if self.errors.get(account_id) != message:
-                        logger.warning(f'账号浏览器 {account_id}: {message}')
-                    self.errors[account_id] = message
+        await self.browsers.discover()
+        async with self.browsers.lock(PRIMARY):
+            records = self.db.get_all_cookies()
+            if len(records) > 1:
+                await self.stop()
+                return
+            if not records:
+                if self.pending_owner is not None:
+                    await self.ensure(self.pending_owner)
+                elif self.listener:
+                    await self.stop()
+                    self.manual.clear()
+                return
+            account_id = next(iter(records))
+            if not self.db.get_cookie_status(account_id):
+                await self.stop()
+                return
+            record = self.db.get_cookie_details(account_id)
+            if record:
+                await self.ensure(record['user_id'], account_id, record['value'])
+                self.errors.pop(account_id, None)
 
     async def run(self):
         while True:
             try:
                 await self.reconcile()
             except Exception as exc:
-                logger.warning(f'账号浏览器管理异常: {type(exc).__name__}')
+                message = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else type(exc).__name__
+                logger.warning(f'账号浏览器管理异常: {message}')
             await asyncio.sleep(10)
 
     def start(self):
-        self.task = asyncio.create_task(self.run(), name='account-browsers')
+        self.task = asyncio.create_task(self.run(), name='account-browser')
 
     async def close(self):
         if self.task:
             self.task.cancel()
             await asyncio.gather(self.task, return_exceptions=True)
-        for account_id in list(self.viewers):
-            await self.disconnect(account_id)
+        if self.listener:
+            await self.listener.close()
         await self.browsers.close()

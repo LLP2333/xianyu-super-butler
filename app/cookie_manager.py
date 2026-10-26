@@ -309,6 +309,8 @@ class CookieManager:
         if instance is not None:
             # 登录态过期是终态：滑块、等待冷却都救不回来，只能重新扫码。
             # 必须与普通重连区分开，否则界面只显示「连接中」，用户会一直等。
+            if getattr(instance, 'last_token_refresh_status', None) == 'waiting_browser_token':
+                return 'waiting_browser'
             if getattr(instance, 'needs_relogin', False):
                 return "need_relogin"
             state = getattr(instance, 'connection_state', None)

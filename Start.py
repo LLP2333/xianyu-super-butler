@@ -665,6 +665,7 @@ except Exception as e:
 # ==================== 现在可以安全地导入其他模块 ====================
 import asyncio
 import threading
+import signal
 from urllib.parse import urlparse
 from loguru import logger
 
@@ -682,8 +683,8 @@ from app import cookie_manager as cm
 from app.file_log_collector import setup_file_logging
 
 
-def _start_api_server():
-    """后台线程启动 FastAPI 服务"""
+def _start_api_server(stop_event):
+    """后台线程运行 API，退出前完成 ASGI lifespan 清理。"""
     loop = None
     api_conf = AUTO_REPLY.get('api', {})
 
@@ -715,11 +716,22 @@ def _start_api_server():
     # 在后台线程中创建独立事件循环并直接运行 server.serve()
     import uvicorn
     try:
-        config = uvicorn.Config("app.reply_server:app", host=host, port=port, log_level="info")
+        config = uvicorn.Config("app.reply_server:app", host=host, port=port, log_level="info", timeout_graceful_shutdown=10)
         server = uvicorn.Server(config)
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(server.serve())
+        async def serve():
+            async def watch_stop():
+                while not stop_event.is_set():
+                    await asyncio.sleep(0.1)
+                server.should_exit = True
+            watcher = asyncio.create_task(watch_stop())
+            try:
+                await server.serve()
+            finally:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+        loop.run_until_complete(serve())
     except Exception as e:
         logger.error(f"uvicorn服务器启动失败: {e}")
     finally:
@@ -806,16 +818,35 @@ async def main():
 
     # 启动 API 服务线程
     print("启动 API 服务线程...")
-    threading.Thread(target=_start_api_server, daemon=True).start()
+    shutdown = asyncio.Event()
+    api_stop = threading.Event()
+    previous_handlers = {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        previous_handlers[sig] = signal.signal(sig, lambda *_: loop.call_soon_threadsafe(shutdown.set))
+    api_thread = threading.Thread(target=_start_api_server, args=(api_stop,), daemon=True)
+    api_thread.start()
     print("API 服务线程已启动")
 
     # 启动数据库自动备份：全局一份，不随账号数量重复
     print("启动数据库自动备份任务...")
-    asyncio.create_task(_db_backup_loop())
+    backup_task = asyncio.create_task(_db_backup_loop())
 
     # 阻塞保持运行
     print("主程序启动完成，保持运行...")
-    await asyncio.Event().wait()
+    try:
+        await shutdown.wait()
+    finally:
+        api_stop.set()
+        tasks = [backup_task, *manager.tasks.values()]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        # Keep the account event loop running while API shutdown closes owned desktops.
+        await asyncio.to_thread(api_thread.join, 40)
+        if api_thread.is_alive():
+            logger.error("API 清理超时，请检查账号浏览器容器状态")
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
 
 
 async def _db_backup_loop():

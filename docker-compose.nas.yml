@@ -17,6 +17,7 @@
 # 首次使用前推送 personal，等待 Publish personal Docker image 成功。
 # 默认跟随 personal；固定版本时将下方标签改成 sha-<完整提交号>。
 # 更新并启动：
+#   docker pull lscr.io/linuxserver/chrome:latest
 #   docker compose -f docker-compose.nas.yml pull
 #   docker compose -f docker-compose.nas.yml up -d
 
@@ -24,14 +25,23 @@ services:
   xianyu-app:
     image: ghcr.io/llp2333/xianyu-super-butler:personal
     container_name: xianyu-super-butler
+    stop_grace_period: 60s
     restart: unless-stopped
     ports:
       - "8080:8080"
     volumes:
+      # Grants the application full Docker management authority.
+      - /var/run/docker.sock:/var/run/docker.sock
       - ./data:/app/data:rw
       - ./logs:/app/logs:rw
       - ./backups:/app/backups:rw
     environment:
+      ACCOUNT_BROWSER_IMAGE: lscr.io/linuxserver/chrome:latest
+      ACCOUNT_BROWSER_NETWORK: xianyu-browsers
+      ACCOUNT_BROWSER_CDP_CONFIG: "${ACCOUNT_BROWSER_CDP_CONFIG:-${PWD}/deploy/account-browser/cdp.conf}"
+      ACCOUNT_BROWSER_BIND: "${ACCOUNT_BROWSER_BIND:-127.0.0.1}"
+      ACCOUNT_BROWSER_API_URL: "http://xianyu-app:8080"
+      ACCOUNT_BROWSER_HOST: "${ACCOUNT_BROWSER_HOST:-localhost}"
       TZ: Asia/Shanghai
       DB_PATH: /app/data/xianyu_data.db
       LOG_LEVEL: INFO
@@ -44,6 +54,8 @@ services:
       AUTO_REPLY_ENABLED: "true"
       AUTO_DELIVERY_ENABLED: "true"
       AI_REPLY_ENABLED: "false"
+    networks:
+      - browser-network
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 30s
@@ -56,3 +68,8 @@ services:
           memory: 3072M
         reservations:
           memory: 512M
+
+networks:
+  browser-network:
+    name: xianyu-browsers
+    driver: bridge
