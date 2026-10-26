@@ -574,7 +574,7 @@ const App: React.FC = () => {
             <Suspense fallback={activeTab === 'dashboard' ? <PageLoader /> : null}><Dashboard /></Suspense>
           </section>
           <section hidden={activeTab !== 'accounts'}>
-            <Suspense fallback={activeTab === 'accounts' ? <PageLoader /> : null}><AccountList /></Suspense>
+            <Suspense fallback={activeTab === 'accounts' ? <PageLoader /> : null}><AccountList isAdmin={isAdmin} /></Suspense>
           </section>
           <section hidden={activeTab !== 'items'}>
             <Suspense fallback={activeTab === 'items' ? <PageLoader /> : null}><ItemList /></Suspense>

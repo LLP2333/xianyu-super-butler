@@ -20,6 +20,7 @@ class CookieManager:
         self.cookie_status: Dict[str, bool] = {}  # 账号启用状态
         self.auto_confirm_settings: Dict[str, bool] = {}  # 自动确认发货设置
         self._task_locks: Dict[str, asyncio.Lock] = {}  # 每个cookie_id的任务锁，防止重复创建
+        self.browser_paused = set()
         self._load_from_db()
 
     def _load_from_db(self):
@@ -169,6 +170,9 @@ class CookieManager:
                 logger.info(f"【{cookie_id}】账号已禁用，仅更新Cookie，不启动监听任务")
                 return None
 
+            if cookie_id in self.browser_paused:
+                return None
+
             existing_task = self.tasks.get(cookie_id)
             if existing_task and not existing_task.done():
                 if not restart:
@@ -287,6 +291,8 @@ class CookieManager:
 
     def get_task_state(self, cookie_id: str) -> str:
         """返回账号监听任务状态。"""
+        if cookie_id in self.browser_paused:
+            return "manual"
         task = self.tasks.get(cookie_id)
         if not task:
             return "stopped"
@@ -332,6 +338,7 @@ class CookieManager:
         async def pause():
             lock = self._task_locks.setdefault(cookie_id, asyncio.Lock())
             async with lock:
+                self.browser_paused.add(cookie_id)
                 instance = self.instances.get(cookie_id)
                 if instance is not None:
                     instance.manual_captcha_in_progress = True
@@ -349,6 +356,21 @@ class CookieManager:
                         instance.manual_captcha_in_progress = False
 
         await self._await_on_account_loop(pause())
+
+    async def release_browser_pause(self, cookie_id: str):
+        async def release():
+            self.browser_paused.discard(cookie_id)
+        await self._await_on_account_loop(release())
+
+    async def resume_cookie_task(self, cookie_id: str, cookies: str):
+        async def resume():
+            self.browser_paused.discard(cookie_id)
+            try:
+                await self._update_cookie_async(cookie_id, cookies, save_to_db=False)
+            except BaseException:
+                self.browser_paused.add(cookie_id)
+                raise
+        await self._await_on_account_loop(resume())
 
     async def update_cookie_async(self, cookie_id: str, new_value: str, save_to_db: bool = True):
         """Async callers use this entry point from either event loop."""
@@ -404,7 +426,7 @@ class CookieManager:
             self.keywords[cookie_id] = original_keywords
             self.cookie_status[cookie_id] = original_status
 
-            if original_status:
+            if original_status and cookie_id not in self.browser_paused:
                 task = self.loop.create_task(
                     self._run_xianyu(cookie_id, new_value, original_user_id),
                     name=f"xianyu-account-{cookie_id}",

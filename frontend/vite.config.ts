@@ -11,6 +11,7 @@ export default defineConfig({
     },
   },
   build: {
+    target: 'es2022',
     outDir: process.env.VITE_OUT_DIR || '../static',
     sourcemap: false,
     rollupOptions: {

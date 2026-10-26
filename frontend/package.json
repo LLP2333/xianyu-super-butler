@@ -9,6 +9,7 @@
     "preview": "node -e \"console.error('Standalone frontend preview is disabled. Open http://localhost:8080/ after running python Start.py.'); process.exit(1)\""
   },
   "dependencies": {
+    "@novnc/novnc": "1.7.0",
     "axios": "^1.13.2",
     "lucide-react": "^0.562.0",
     "react": "^19.2.3",

@@ -1,3 +1,4 @@
+import AccountBrowser from './AccountBrowser';
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { AccountDetail, AIReplySettings } from '../types';
@@ -17,7 +18,6 @@ import {
   getAccountAISettings,
   refreshAccountProfile,
   getRiskControlStatus,
-  startManualCaptchaSession,
 } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
 import {Power, Edit2, Trash2, QrCode, X, Check, Loader2, MessageSquare, RefreshCw, Save, User, Clock, Key, Eye, EyeOff, Bot, Settings, MapPin, Users, ShieldCheck} from 'lucide-react';
@@ -25,7 +25,7 @@ import { EmptyState, PageHeader, PageLoading } from './ui';
 
 type ModalType = 'edit' | 'ai-settings' | null;
 
-const AccountList: React.FC = () => {
+const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
   const [accounts, setAccounts] = useState<AccountDetail[]>([]);
   const [loading, setLoading] = useState(true);
   // 风控熔断状态：命中后账号会暂停请求，需要让用户看到而不是只报 409
@@ -48,19 +48,7 @@ const AccountList: React.FC = () => {
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [editingAccount, setEditingAccount] = useState<AccountDetail | null>(null);
   const [refreshingProfileId, setRefreshingProfileId] = useState<string | null>(null);
-  const [manualCaptchaId, setManualCaptchaId] = useState<string | null>(null);
-  // 人工滑块验证弹窗：把服务器端浏览器的画面镜像到本页
-  const [captchaAccount, setCaptchaAccount] = useState<AccountDetail | null>(null);
-  const [captchaShot, setCaptchaShot] = useState('');
-  const [captchaStage, setCaptchaStage] = useState<'starting' | 'ready' | 'verifying' | 'done' | 'failed'>('starting');
-  const [captchaMessage, setCaptchaMessage] = useState('');
-  const captchaWsRef = useRef<WebSocket | null>(null);
-  const captchaSessionRef = useRef('');
-  const captchaOriginRef = useRef({ x: 0, y: 0 });
-  const captchaVerifyingRef = useRef(false);
-  const captchaFinishedRef = useRef(false);
-  const captchaPointerRef = useRef<number | null>(null);
-  const captchaImgRef = useRef<HTMLImageElement>(null);
+  const [browserAccount, setBrowserAccount] = useState<AccountDetail | null>(null);
   const [failedAvatars, setFailedAvatars] = useState<Set<string>>(new Set());
 
   // 编辑表单状态
@@ -179,145 +167,6 @@ const AccountList: React.FC = () => {
       await deleteAccount(id);
       loadAccounts();
     }
-  };
-
-  // 人工滑块验证：在本页开弹窗，通过 WebSocket 把服务器端浏览器的截图推过来，
-  // 鼠标事件再回传驱动服务器上的真实浏览器 —— 相当于把远端浏览器镜像到这里。
-  // 这样部署在没有桌面的服务器上也能人工过验证，不需要访问服务器屏幕。
-  const handleManualCaptcha = async (account: AccountDetail) => {
-    const bytes = crypto.getRandomValues(new Uint8Array(16));
-    bytes[6] = (bytes[6] & 15) | 64;
-    bytes[8] = (bytes[8] & 63) | 128;
-    const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
-    captchaSessionRef.current = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-    captchaOriginRef.current = { x: 0, y: 0 };
-    captchaVerifyingRef.current = false;
-    captchaFinishedRef.current = false;
-    setCaptchaAccount({ ...account });
-    setCaptchaShot('');
-    setCaptchaStage('starting');
-    setCaptchaMessage('正在服务器上启动验证页面，请稍候…');
-    setManualCaptchaId(account.id);
-
-    try {
-      const result = await startManualCaptchaSession(account.id, captchaSessionRef.current);
-      if (!result.success) throw new Error(result.message || '人工验证未完成');
-      captchaFinishedRef.current = true;
-      setCaptchaStage('done');
-      setCaptchaMessage(result.message || '验证完成，账号 Cookie 已更新');
-      notify(result.message || '人工验证完成，账号 Cookie 已更新', 'success');
-      try {
-        const status = await getRiskControlStatus();
-        setRiskBlocked((status.accounts || []).filter(item => item.blocked || (item.verification_type && item.verification_type !== 'none')));
-        await loadAccounts({ silent: true });
-      } catch {
-        notify('账号已完成验证，但列表刷新失败，请刷新页面查看状态', 'info');
-      }
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : '人工验证启动失败';
-      setCaptchaStage('failed');
-      setCaptchaMessage(msg);
-      notify(msg, 'error');
-    } finally {
-      captchaFinishedRef.current = true;
-      captchaVerifyingRef.current = true;
-      captchaPointerRef.current = null;
-      captchaWsRef.current?.close();
-      setManualCaptchaId(null);
-    }
-  };
-
-  // 弹窗打开后连上服务器端会话，持续接收截图；关闭时断开
-  useEffect(() => {
-    if (!captchaAccount) {
-      captchaWsRef.current?.close();
-      captchaWsRef.current = null;
-      return;
-    }
-
-    let closed = false;
-    let retry = 0;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-
-    const connect = () => {
-      if (closed || captchaFinishedRef.current) return;
-      timer = undefined;
-      const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-      const ws = new WebSocket(
-        `${scheme}://${location.host}/api/captcha/ws/${encodeURIComponent(captchaSessionRef.current)}`
-      );
-      captchaWsRef.current = ws;
-
-      ws.onmessage = event => {
-        if (closed || captchaFinishedRef.current || captchaWsRef.current !== ws) return;
-        let data: any;
-        try {
-          data = JSON.parse(event.data);
-        } catch {
-          return;
-        }
-        if (data.type === 'session_info' || data.type === 'screenshot_update') {
-          if (data.origin) captchaOriginRef.current = data.origin;
-          if (data.screenshot) {
-            setCaptchaShot(
-              String(data.screenshot).startsWith('data:')
-                ? data.screenshot
-                : `data:image/jpeg;base64,${data.screenshot}`
-            );
-            if (data.type === 'session_info') {
-              captchaVerifyingRef.current = data.phase === 'verifying';
-              setCaptchaStage(data.phase === 'verifying' ? 'verifying' : 'ready');
-              setCaptchaMessage(data.message);
-            }
-          }
-        } else if (data.type === 'verifying') {
-          captchaVerifyingRef.current = true;
-          setCaptchaStage('verifying');
-          setCaptchaMessage(data.message);
-        } else if (data.type === 'retry') {
-          captchaVerifyingRef.current = false;
-          setCaptchaStage('ready');
-          setCaptchaMessage(data.message);
-        } else if (data.type === 'error') {
-          setCaptchaMessage(data.message || '验证通道异常，正在重新连接…');
-          ws.close();
-        }
-
-      };
-
-      ws.onclose = () => {
-        if (!closed && !captchaFinishedRef.current && !timer && retry < 20) {
-          retry += 1;
-          timer = setTimeout(connect, 1000);
-        }
-      };
-    };
-
-    connect();
-    return () => {
-      closed = true;
-      if (timer) clearTimeout(timer);
-      captchaWsRef.current?.close();
-      captchaWsRef.current = null;
-    };
-  }, [captchaAccount]);
-
-  // 把本页的鼠标坐标换算成服务器端浏览器的坐标后回传
-  const sendCaptchaMouse = (eventType: 'down' | 'move' | 'up', e: React.PointerEvent) => {
-    const ws = captchaWsRef.current;
-    const img = captchaImgRef.current;
-    if (captchaVerifyingRef.current || !ws || ws.readyState !== WebSocket.OPEN || !img || !img.naturalWidth) return;
-
-    const rect = img.getBoundingClientRect();
-    // 截图在页面上被等比缩放显示，坐标要按缩放比还原回原始分辨率
-    const x = (e.clientX - rect.left) * (img.naturalWidth / rect.width);
-    const y = (e.clientY - rect.top) * (img.naturalHeight / rect.height);
-    ws.send(JSON.stringify({
-      type: 'mouse_event',
-      event_type: eventType,
-      x: Math.round(x + captchaOriginRef.current.x),
-      y: Math.round(y + captchaOriginRef.current.y),
-    }));
   };
 
   const openEditModal = (account: AccountDetail) => {
@@ -537,6 +386,9 @@ const AccountList: React.FC = () => {
     }
     // 登录态过期是终态：等待和过验证都没用，必须重新扫码。
     // 与「连接中」分开显示，否则用户会一直等一个不会变好的状态。
+    if (account.runtime_state === 'manual') {
+      return { label: '浏览器接管中', className: 'bg-amber-100 text-amber-800' };
+    }
     if (account.runtime_state === 'need_relogin') {
       return { label: '需重新扫码', className: 'bg-red-100 text-red-700' };
     }
@@ -684,18 +536,13 @@ const AccountList: React.FC = () => {
             </div>
             <div className="flex items-center justify-end gap-1 border-t border-gray-100 pt-3 sm:border-0 sm:pt-0">
                 <button
-                    onClick={() => handleManualCaptcha(account)}
-                    disabled={manualCaptchaId !== null || !blockedState}
-                    className={`flex items-center gap-1.5 rounded-md px-2.5 py-2 text-xs font-bold disabled:cursor-not-allowed disabled:opacity-40 ${blockedState ? 'bg-amber-100 text-amber-800 hover:bg-amber-200' : 'text-gray-400'}`}
-                    title={blockedState
-                      ? '账号被闲鱼要求人机验证，点此在页面内手动拖动滑块解除'
-                      : '账号当前不在风控状态，无需人工验证'}
-                    aria-label={blockedState ? '人工滑块验证' : '账号未处于风控，无需验证'}
+                    onClick={() => setBrowserAccount(account)}
+                    disabled={!account.enabled || !isAdmin}
+                    className="flex items-center gap-1.5 rounded-md bg-amber-100 px-2.5 py-2 text-xs font-bold text-amber-800 disabled:opacity-40"
+                    title={isAdmin ? '打开账号独享浏览器，接管期间暂停自动任务' : '仅管理员可操作服务器浏览器'}
                 >
-                    {manualCaptchaId === account.id
-                      ? <Loader2 className="h-4 w-4 animate-spin" />
-                      : <ShieldCheck className="h-4 w-4" />}
-                    <span>人工验证</span>
+                    <ShieldCheck className="h-4 w-4" />
+                    <span>打开浏览器</span>
                 </button>
                 <button
                     onClick={() => handleRefreshProfile(account.id)}
@@ -1164,145 +1011,13 @@ const AccountList: React.FC = () => {
         document.body
       )}
 
-      {captchaAccount && createPortal(
-        <div className="modal-overlay">
-          <div className="modal-container modal-container-lg">
-            <div className="modal-header flex items-start justify-between gap-4">
-              <div>
-                <h3 className="text-lg font-bold text-gray-900">人工滑块验证</h3>
-                <p className="mt-1 text-sm text-gray-500">
-                  {captchaAccount.nickname || captchaAccount.id}
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => {
-                  if (manualCaptchaId) {
-                    captchaWsRef.current?.send(JSON.stringify({ type: 'cancel' }));
-                    setCaptchaMessage('正在结束验证并恢复账号任务…');
-                  } else {
-                    setCaptchaAccount(null);
-                  }
-                }}
-                disabled={captchaStage === 'starting'}
-                title={manualCaptchaId ? '取消验证' : '关闭'}
-                className="rounded-md p-2 hover:bg-gray-100"
-                aria-label="关闭"
-              >
-                <X className="h-5 w-5" />
-              </button>
-            </div>
+      {browserAccount && <AccountBrowser account={browserAccount}
+        onClose={() => setBrowserAccount(null)}
+        onChanged={() => {
+          void loadAccounts({ silent: true });
+          void getRiskControlStatus().then(data => setRiskBlocked((data.accounts || []).filter(item => item.blocked || (item.verification_type && item.verification_type !== 'none'))));
+        }} />}
 
-            <div className="modal-body space-y-4">
-              <div className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-xs leading-relaxed text-blue-800">
-                <p className="font-bold">这是什么？</p>
-                <p className="mt-1">
-                  闲鱼要求人机验证时，系统会自动尝试滑动，但成功率有限。此处把
-                  <b>服务器上浏览器的画面实时投屏</b>到这里，你用鼠标拖动，
-                  操作会回传到服务器驱动真实浏览器 —— 因此部署在无桌面的服务器上也能用。
-                </p>
-                <p className="mt-1">
-                  操作完成后系统会回收登录凭证并请求 Token；确认成功后才恢复账号任务。
-                </p>
-              </div>
-
-              <div className={`rounded-md px-3 py-2 text-sm font-semibold ${
-                captchaStage === 'done'
-                  ? 'bg-green-50 text-green-700'
-                  : captchaStage === 'failed'
-                    ? 'bg-red-50 text-red-700'
-                    : 'bg-amber-50 text-amber-800'
-              }`}>
-                {captchaMessage || '正在准备…'}
-                {captchaStage === 'failed' && (
-                  <div className="mt-3">
-                    <button
-                      type="button"
-                      disabled={manualCaptchaId !== null}
-                      onClick={() => handleManualCaptcha(captchaAccount)}
-                      className="inline-flex items-center gap-2 rounded-md bg-amber-100 px-3 py-2 text-amber-900 disabled:opacity-50"
-                    >
-                      <RefreshCw className="h-4 w-4" />
-                      重新加载验证页
-                    </button>
-                    <p className="mt-2 text-xs font-normal">点击后会开启新的验证会话；若持续失败，请在闲鱼官方客户端检查账号验证要求。</p>
-                  </div>
-                )}
-              </div>
-
-              <div className="flex min-h-[320px] items-center justify-center rounded-md border-2 border-dashed border-gray-200 bg-gray-50 p-2">
-                {captchaShot ? (
-                  <img
-                    ref={captchaImgRef}
-                    src={captchaShot}
-                    alt="服务器端验证页面"
-                    draggable={false}
-                    className="max-h-[460px] w-auto cursor-crosshair select-none rounded"
-                    style={{ touchAction: 'none' }}
-                    onPointerDown={e => {
-                      if (captchaStage !== 'ready' || e.button !== 0 || captchaPointerRef.current !== null) return;
-                      e.preventDefault();
-                      captchaPointerRef.current = e.pointerId;
-                      e.currentTarget.setPointerCapture(e.pointerId);
-                      sendCaptchaMouse('down', e);
-                    }}
-                    onPointerMove={e => {
-                      if (captchaPointerRef.current === e.pointerId) sendCaptchaMouse('move', e);
-                    }}
-                    onPointerUp={e => {
-                      if (captchaPointerRef.current !== e.pointerId) return;
-                      sendCaptchaMouse('up', e);
-                      captchaPointerRef.current = null;
-                      e.currentTarget.releasePointerCapture(e.pointerId);
-                    }}
-                    onLostPointerCapture={e => {
-                      if (captchaPointerRef.current === e.pointerId) sendCaptchaMouse('up', e);
-                      captchaPointerRef.current = null;
-                    }}
-                    onPointerCancel={e => {
-                      if (captchaPointerRef.current === e.pointerId) sendCaptchaMouse('up', e);
-                      captchaPointerRef.current = null;
-                    }}
-                  />
-                ) : (
-                  <div className="text-center text-sm text-gray-500">
-                    <Loader2 className="mx-auto mb-2 h-6 w-6 animate-spin text-gray-400" />
-                    正在服务器上打开验证页面…
-                    <p className="mt-1 text-xs text-gray-400">
-                      首次启动需要几秒，若账号当前不在风控状态则不会出现滑块
-                    </p>
-                  </div>
-                )}
-              </div>
-
-              <p className="text-xs text-gray-500">
-                操作方式：在上方画面的滑块按钮上 <b>按住鼠标左键</b>，
-                <b>向右拖到底</b> 后松开。画面会随你的操作实时刷新。
-              </p>
-            </div>
-
-            <div className="modal-footer flex justify-end">
-              <button
-                type="button"
-                onClick={() => {
-                  if (manualCaptchaId) {
-                    captchaWsRef.current?.send(JSON.stringify({ type: 'cancel' }));
-                    setCaptchaMessage('正在结束验证并恢复账号任务…');
-                  } else {
-                    setCaptchaAccount(null);
-                  }
-                }}
-                disabled={captchaStage === 'starting'}
-                title={manualCaptchaId ? '取消验证' : '关闭'}
-                className="ios-btn-secondary rounded-md px-4 py-2 text-sm"
-              >
-                关闭
-              </button>
-            </div>
-          </div>
-        </div>,
-        document.body
-      )}
     </div>
   );
 };

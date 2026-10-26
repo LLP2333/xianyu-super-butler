@@ -70,6 +70,9 @@ RUN apt-get update && \
         libglib2.0-0 \
         xvfb \
         x11-utils \
+        x11vnc \
+        openbox \
+        fonts-noto-cjk \
         nodejs \
         npm && \
     rm -rf /var/lib/apt/lists/*

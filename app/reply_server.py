@@ -57,14 +57,6 @@ notification_test_service = NotificationTestService(
     limiter=notification_test_rate_limiter,
 )
 
-# 刮刮乐远程控制路由
-try:
-    from app.api_captcha_remote import router as captcha_router
-    CAPTCHA_ROUTER_AVAILABLE = True
-except ImportError:
-    logger.warning("⚠️ api_captcha_remote 未找到，刮刮乐远程控制功能不可用")
-    CAPTCHA_ROUTER_AVAILABLE = False
-
 # 关键字文件路径
 KEYWORDS_FILE = PROJECT_ROOT / "回复关键字.txt"
 
@@ -363,12 +355,19 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
-# 注册刮刮乐远程控制路由
-if CAPTCHA_ROUTER_AVAILABLE:
-    app.include_router(captcha_router)
-    logger.info("✅ 已注册刮刮乐远程控制路由: /api/captcha")
-else:
-    logger.warning("⚠️ 刮刮乐远程控制路由未注册")
+from app.api_account_browser import create_account_browser_router
+from app.services.account_browser import AccountBrowserService
+
+account_browser_service = AccountBrowserService(db_manager, lambda: cookie_manager.manager)
+app.include_router(create_account_browser_router(require_admin, account_browser_service))
+
+@app.on_event('startup')
+async def start_account_browsers():
+    account_browser_service.start()
+
+@app.on_event('shutdown')
+async def stop_account_browsers():
+    await account_browser_service.close()
 
 app.include_router(create_delivery_block_router(get_current_user, db_manager))
 logger.info("已注册发货拦截规则路由")
@@ -9339,99 +9338,6 @@ def use_quick_phrase(
     """记录一次使用，用于统计高频短语。"""
     from app.db_manager import db_manager
     return {'success': db_manager.increment_quick_phrase_usage(phrase_id)}
-
-
-_manual_captcha_accounts = set()
-
-
-@app.post('/api/captcha/manual-session')
-async def start_manual_captcha(
-    cookie_id: str = Form(...),
-    session_id: str = Form(...),
-    timeout: int = Form(300),
-    current_user: Dict[str, Any] = Depends(get_current_user)
-):
-    """Recover an account only after its collected cookies obtain a Token."""
-    from utils.manual_captcha import open_manual_session
-    from utils import risk_control
-    from uuid import UUID
-    from loguru import logger
-    from utils.log_sanitizer import redact_sensitive_text
-    import traceback
-
-    try:
-        session_id = str(UUID(session_id))
-    except ValueError:
-        raise HTTPException(status_code=400, detail='验证会话编号无效')
-    user_cookies = db_manager.get_all_cookies(current_user['user_id'])
-    if cookie_id not in user_cookies:
-        raise HTTPException(status_code=404, detail='账号不存在或无权访问')
-    if cookie_id in _manual_captcha_accounts:
-        raise HTTPException(status_code=409, detail='该账号已有人工验证会话，请完成或等待其结束')
-    _manual_captcha_accounts.add(cookie_id)
-    manager = cookie_manager.manager
-    result = {'success': False, 'session_id': session_id, 'stage': 'account_pause', 'message': ''}
-    saved = False
-    paused = False
-    resume_attempted = False
-    try:
-        if manager:
-            await manager.pause_cookie_task(cookie_id)
-            paused = True
-        # Automatic refresh may have rotated cookies while its task was stopping.
-        user_cookies = db_manager.get_all_cookies(current_user['user_id'])
-        if cookie_id not in user_cookies:
-            raise RuntimeError('账号已被删除')
-        timeout = max(60, min(int(timeout or 300), 900))
-        result['stage'] = 'manual_session'
-        result = await asyncio.wait_for(open_manual_session(
-            cookie_id, user_cookies[cookie_id], timeout=timeout, session_id=session_id
-        ), timeout=timeout + 120)
-        if result['success']:
-            result['stage'] = 'cookie_save'
-            if not db_manager.update_cookie_account_info(cookie_id, cookie_value=result['cookies_str']):
-                raise RuntimeError('Cookie 保存失败')
-            saved = True
-            risk_control.registry.get(cookie_id).reset()
-        else:
-            risk_control.registry.get(cookie_id).trip(result['message'])
-        if manager:
-            verification_stage = result.get('stage', 'manual_session')
-            result['stage'] = 'account_resume'
-            resume_attempted = True
-            await manager.update_cookie_async(
-                cookie_id, result['cookies_str'] if saved else user_cookies[cookie_id], save_to_db=False
-            )
-            if not result['success']:
-                result['stage'] = verification_stage
-        if result['success']:
-            result['message'] = '人工验证成功，Cookie 已保存、Token 已确认'
-            if manager and manager.cookie_status.get(cookie_id, True):
-                result['message'] += '，账号任务已重启'
-            else:
-                result['message'] += '，启用账号后即可连接'
-    except Exception as exc:
-        detail = redact_sensitive_text(f'{type(exc).__name__}: {exc}')
-        result.update(success=False, message=f"[{result['stage']}] 恢复失败（{detail}）")
-        logger.error(f"【{cookie_id}】{result['message']}\n{redact_sensitive_text(traceback.format_exc())}")
-        # A local lifecycle failure is not evidence of a new platform risk-control hit.
-        if manager and paused and not resume_attempted:
-            try:
-                await manager.update_cookie_async(cookie_id, result.get('cookies_str') if saved else user_cookies[cookie_id], save_to_db=False)
-            except Exception as resume_exc:
-                resume_detail = redact_sensitive_text(f'{type(resume_exc).__name__}: {resume_exc}')
-                result['message'] += f'；[account_resume] 账号任务恢复失败（{resume_detail}），请重新启用账号'
-                logger.error(f"【{cookie_id}】账号任务恢复失败\n{redact_sensitive_text(traceback.format_exc())}")
-    finally:
-        _manual_captcha_accounts.discard(cookie_id)
-    db_manager.add_risk_control_log(
-        cookie_id=cookie_id, event_type='slider_captcha',
-        event_description='人工滑块验证与 Token 恢复确认',
-        processing_result=result['message'],
-        processing_status='success' if result['success'] else 'failed',
-        error_message=None if result['success'] else result['message'],
-    )
-    return JSONResponse({key: result.get(key, '') for key in ('success', 'message', 'session_id', 'stage')})
 
 
 def classify_verification_event(detail: str, blocked: bool = False, reason: str = '') -> Tuple[str, str]:

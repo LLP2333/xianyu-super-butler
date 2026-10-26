@@ -337,21 +337,11 @@ export const getRiskControlStatus = async (): Promise<{
   return get('/api/risk-control/status');
 };
 
-export const startManualCaptchaSession = async (
-  cookieId: string,
-  sessionId: string,
-  timeout: number = 300,
-): Promise<{
-  success: boolean;
-  message: string;
-  session_id: string;
-}> => {
-  const formData = new FormData();
-  formData.append('cookie_id', cookieId);
-  formData.append('timeout', String(timeout));
-  formData.append('session_id', sessionId);
-  return post('/api/captcha/manual-session', formData, { timeout: (timeout + 180) * 1000 });
-};
+export const accountBrowserAction = (accountId: string, action: 'open' | 'challenge' | 'confirm' | 'release'): Promise<{ message: string }> =>
+  post(`/api/account-browser/${encodeURIComponent(accountId)}/${action}`, {}, { timeout: 120000 });
+
+export const accountBrowserTicket = (accountId: string): Promise<{ ticket: string }> =>
+  post(`/api/account-browser/${encodeURIComponent(accountId)}/ticket`, {});
 
 // 商品擦亮：重新获取搜索曝光，平台对每日次数有限制
 export const polishItems = async (cookieId?: string, itemIds?: string[]): Promise<any> => {

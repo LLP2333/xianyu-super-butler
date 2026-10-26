@@ -51,7 +51,7 @@ export interface AccountDetail {
   followers?: number;
   following?: number;
   profile_updated_at?: string;
-  runtime_state?: 'running' | 'connecting' | 'need_relogin' | 'stopped' | 'cancelled' | 'failed';
+  runtime_state?: 'manual' | 'running' | 'connecting' | 'need_relogin' | 'stopped' | 'cancelled' | 'failed';
   // AI设置
   ai_enabled?: boolean;
   max_discount_percent?: number;
