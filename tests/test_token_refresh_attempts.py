@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 import XianyuAutoAsync as runtime
 from utils.account_browser.tokens import BrowserToken, TokenStore
+from utils import risk_control
 
 
 class TokenRefreshAttemptTests(unittest.IsolatedAsyncioTestCase):
@@ -13,6 +14,10 @@ class TokenRefreshAttemptTests(unittest.IsolatedAsyncioTestCase):
         p = patch('utils.account_browser.tokens.tokens', self.store)
         p.start()
         self.addCleanup(p.stop)
+        p = patch('utils.account_browser.credentials.tokens', self.store)
+        p.start(); self.addCleanup(p.stop)
+        p = patch('utils.risk_control.registry', risk_control.RiskControlRegistry())
+        p.start(); self.addCleanup(p.stop)
         self.live = runtime.XianyuLive.__new__(runtime.XianyuLive)
         self.live.cookie_id = 'test'
         self.live.myid = '123'
@@ -82,3 +87,14 @@ class TokenRefreshAttemptTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.store.get('test'))
         self.assertIsNone(await self.live.refresh_token())
         self.live.session.post.assert_not_called()
+
+    async def test_message_frames_stop_immediately_after_invalidation(self):
+        value=self.capture()
+        await self.live.refresh_token()
+        ws=AsyncMock()
+        await self.live._send_account_frame(ws,'first')
+        from utils.account_browser.credentials import invalidate_credentials
+        invalidate_credentials('test','expired',value)
+        with self.assertRaises(risk_control.RiskControlBlocked):
+            await self.live._send_account_frame(ws,'second')
+        ws.send.assert_awaited_once_with('first')

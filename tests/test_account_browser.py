@@ -1,4 +1,4 @@
-"""Single-account onboarding, identity, explicit credential adoption and browser reset."""
+"""Single-account onboarding, identity, automatic credential adoption and browser reset."""
 import asyncio
 import unittest
 from types import SimpleNamespace
@@ -6,12 +6,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import aiohttp
 from app.services.account_browser import AccountBrowserService, PRIMARY, PENDING
 from utils.account_browser.tokens import BrowserToken, TokenStore
+from utils import risk_control
 
 
 class ServiceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.store = TokenStore()
         p = patch('app.services.account_browser.tokens', self.store)
+        p.start(); self.addCleanup(p.stop)
+        p = patch('utils.account_browser.credentials.tokens', self.store)
+        p.start(); self.addCleanup(p.stop)
+        p = patch('utils.risk_control.registry', risk_control.RiskControlRegistry())
         p.start(); self.addCleanup(p.stop)
         self.records = {'123': 'unb=123; cookie2=original'}
         self.db = MagicMock()
@@ -68,7 +73,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     def capture(self, account='123'):
         value=BrowserToken(account,'website-token','website-device','website-app',f'unb={account}; cookie2=web')
-        self.store.observe(account,value)
+        self.store.observe(self.service.listener.account_id if self.service.listener else account,value)
         return value
 
     async def test_open_reuses_primary_browser_and_pauses_once(self):
@@ -87,22 +92,23 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_token_keeps_task_paused(self):
         await self.service.takeover('123',7)
-        with self.assertRaisesRegex(ValueError,'尚未捕获'): await self.service.finish('123',7)
+        self.assertEqual((await self.service.status('123',7))['credentials_state'], 'waiting')
         self.db.update_cookie_account_info.assert_not_called()
         self.manager.resume_cookie_task.assert_not_awaited()
 
-    async def test_confirm_adopts_exact_browser_token(self):
+    async def test_capture_automatically_adopts_exact_browser_token(self):
         await self.service.takeover('123',7)
         value=self.capture()
-        await self.service.finish('123',7)
+        await self.service.capture_credentials(value)
         self.assertIs(self.store.get('123'),value)
         self.manager.resume_cookie_task.assert_awaited_once_with('123',value.cookies)
 
     async def test_switching_account_after_capture_is_rejected(self):
         await self.service.takeover('123',7)
-        self.capture()
+        value=self.capture()
         self.service.listener.current_account.return_value='999'
-        with self.assertRaises(ValueError): await self.service.finish('123',7)
+        await self.service.capture_credentials(value)
+        self.assertEqual((await self.service.status('123',7))['credentials_state'], 'error')
         self.db.update_cookie_account_info.assert_not_called()
 
     async def test_first_login_creates_account_without_restarting_browser(self):
@@ -110,7 +116,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.setup(7)
         original=self.service.listener
         value=self.capture()
-        await self.service.capture_new_account(value)
+        await self.service.capture_credentials(value)
         self.db.create_browser_account.assert_called_once_with('123',value.cookies,7)
         self.assertIs(self.service.listener,original)
         self.assertEqual(original.account_id,'123')
@@ -134,7 +140,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.records.clear()
         await self.service.setup(7)
         self.db.create_browser_account.side_effect=RuntimeError('save failed')
-        await self.service.capture_new_account(self.capture())
+        await self.service.capture_credentials(self.capture())
         self.assertEqual(self.service.setup_error,'save failed')
         self.manager.resume_cookie_task.assert_not_awaited()
         self.assertIsNone(self.store.get('123'))
@@ -163,3 +169,91 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.pending_owner,7)
         self.assertEqual(self.service.listener.account_id,PENDING)
         self.browsers.pool.clear_profile.assert_awaited_once_with(7)
+
+    async def test_duplicate_capture_only_resumes_once(self):
+        await self.service.takeover('123',7)
+        value=self.capture()
+        await self.service.capture_credentials(value)
+        await self.service.capture_credentials(value)
+        self.manager.resume_cookie_task.assert_awaited_once()
+        self.assertEqual((await self.service.status('123',7))['credentials_state'], 'active')
+
+    async def test_save_failure_remains_blocked_and_same_capture_can_retry(self):
+        await self.service.takeover('123',7)
+        value=self.capture()
+        save=self.db.update_cookie_account_info.side_effect
+        self.db.update_cookie_account_info.side_effect=RuntimeError('save failed')
+        await self.service.capture_credentials(value)
+        self.assertIsNone(self.store.get('123'))
+        self.assertTrue(risk_control.registry.get('123').verification_required)
+        self.manager.resume_cookie_task.assert_not_awaited()
+        self.db.update_cookie_account_info.side_effect=save
+        await self.service.capture_credentials(value)
+        self.assertIs(self.store.get('123'),value)
+        self.assertFalse(risk_control.registry.get('123').verification_required)
+        self.manager.resume_cookie_task.assert_awaited_once()
+
+    async def test_start_failure_revokes_and_cancels_account_again(self):
+        await self.service.takeover('123',7)
+        self.manager.resume_cookie_task.side_effect=RuntimeError('start failed')
+        await self.service.capture_credentials(self.capture())
+        self.assertIsNone(self.store.get('123'))
+        self.assertEqual((await self.service.status('123',7))['credentials_state'], 'error')
+        self.assertGreaterEqual(self.manager.pause_cookie_task.await_count,2)
+
+    async def test_open_healthy_account_does_not_pause_and_expiry_does(self):
+        value=self.capture(); self.store.approve('123',value)
+        await self.service.takeover('123',7)
+        self.manager.pause_cookie_task.assert_not_awaited()
+        self.store.reject('123',value.token)
+        await self.service.reconcile()
+        self.manager.pause_cookie_task.assert_awaited_once()
+        self.assertEqual((await self.service.status('123',7))['credentials_state'], 'waiting')
+        fresh=BrowserToken('123','fresh-token','device','app','unb=123; cookie2=fresh')
+        self.store.observe('123',fresh)
+        await self.service.capture_credentials(fresh)
+        self.assertIs(self.store.get('123'),fresh)
+        self.manager.resume_cookie_task.assert_awaited_once_with('123',fresh.cookies)
+
+    async def test_disabled_account_never_resumes_from_capture(self):
+        await self.service.takeover('123',7)
+        self.db.get_cookie_status.return_value=False
+        await self.service.capture_credentials(self.capture())
+        self.manager.resume_cookie_task.assert_not_awaited()
+        self.db.update_cookie_account_info.assert_not_called()
+
+    async def test_website_response_creates_then_renews_account_in_same_listener(self):
+        import json
+        from urllib.parse import urlencode
+        from app.config import API_ENDPOINTS
+        from utils.account_browser.listener import TokenListener
+        from utils.account_browser.credentials import invalidate_credentials
+        self.records.clear()
+        self.service.pending_owner=7
+        listener=TokenListener(PENDING,None,self.browser,self.service.capture_credentials)
+        listener.task=asyncio.current_task()
+        listener.ready.set()
+        listener.context=SimpleNamespace(cookies=AsyncMock(return_value=[{'name':'unb','value':'123'},{'name':'cookie2','value':'website'}]))
+        self.service.listener=listener
+        response=SimpleNamespace(url=API_ENDPOINTS['token'], status=200,
+            request=SimpleNamespace(post_data=urlencode({'data':json.dumps({'deviceId':'native','appKey':'app'})}),all_headers=AsyncMock(return_value={'cookie':'unb=123'})),
+            json=AsyncMock(return_value={'data':{'accessToken':'first'}}))
+        with patch('utils.account_browser.listener.tokens',self.store):
+            await listener.consume(response)
+            self.assertEqual(self.store.get('123').token,'first')
+            invalidate_credentials('123','expired',self.store.get('123'))
+            response.json.return_value={'data':{'accessToken':'second'}}
+            await listener.consume(response)
+            await listener.consume(response)
+        self.assertIs(self.service.listener,listener)
+        self.assertEqual(self.store.get('123').token,'second')
+        self.assertEqual(self.manager.resume_cookie_task.await_count,2)
+        self.assertEqual(self.records['123'],'unb=123; cookie2=website')
+
+    async def test_cancelled_adoption_stays_blocked(self):
+        await self.service.takeover('123',7)
+        self.manager.resume_cookie_task.side_effect=asyncio.CancelledError()
+        with self.assertRaises(asyncio.CancelledError):
+            await self.service.capture_credentials(self.capture())
+        self.assertIsNone(self.store.get('123'))
+        self.assertTrue(risk_control.registry.get('123').verification_required)

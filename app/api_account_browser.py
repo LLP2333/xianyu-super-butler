@@ -116,12 +116,4 @@ def create_account_browser_router(require_operator, service, verify_session):
     async def status(account_id: str, user=Depends(require_operator)):
         return await call(service.status(account_id, user['user_id']))
 
-    @router.post('/{account_id}/confirm')
-    async def confirm(account_id: str, user=Depends(require_operator)):
-        return await call(service.finish(account_id, user['user_id']))
-
-    @router.post('/{account_id}/release')
-    async def release(account_id: str, user=Depends(require_operator)):
-        return await call(service.finish(account_id, user['user_id'], save=False))
-
     return router

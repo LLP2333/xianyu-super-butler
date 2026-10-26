@@ -15,10 +15,14 @@
 import asyncio
 import json
 import unittest
+from unittest.mock import patch
+from utils import risk_control
+from utils.account_browser import credentials
+from utils.account_browser.tokens import BrowserToken, TokenStore
 
 from XianyuAutoAsync import XianyuLive
 
-COOKIES = 'unb=123456; _m_h5_tk=abc_1700000000000; _m_h5_tk_enc=x; cookie2=y'
+COOKIES = 'unb=123456; _m_h5_tk=abc_9999999999999; _m_h5_tk_enc=x; cookie2=y'
 
 
 def make_card(item_id, title='商品', price='9.9'):
@@ -73,6 +77,9 @@ class _FakeSession:
 
 
 def build_live(payloads):
+    value=BrowserToken('123456','fixture-message-token','device','app',COOKIES)
+    credentials.tokens.observe('acc',value)
+    credentials.tokens.approve('acc',value)
     live = XianyuLive(cookies_str=COOKIES, cookie_id='acc', user_id=1)
     live.session = _FakeSession(payloads)
 
@@ -89,8 +96,26 @@ def run(coro):
     return asyncio.run(coro)
 
 
-class NoItemGroupTests(unittest.TestCase):
+class CredentialFixture(unittest.TestCase):
+    def setUp(self):
+        for target,value in [('utils.account_browser.credentials.tokens',TokenStore()),
+                             ('utils.risk_control.registry',risk_control.RiskControlRegistry())]:
+            p=patch(target,value);p.start();self.addCleanup(p.stop)
+
+
+class NoItemGroupTests(CredentialFixture):
     """分组为空，但响应里带着商品。"""
+
+    def test_expired_credentials_skip_discovery_request(self):
+        live=build_live([])
+        credentials.tokens.clear('acc')
+        session=live.session
+        try:
+            result=run(live.get_item_list_info(1,20))
+        finally:
+            run(live.close_session())
+        self.assertTrue(result['waiting_browser'])
+        self.assertEqual(session.requests,[])
 
     def test_items_in_discovery_response_are_used(self):
         payload = {
@@ -182,7 +207,7 @@ class NoItemGroupTests(unittest.TestCase):
         )
 
 
-class AllGroupsEmptyTests(unittest.TestCase):
+class AllGroupsEmptyTests(CredentialFixture):
     """分组存在但都是 0 件 —— 这个分支原先也漏了 success。"""
 
     def test_success_flag_is_present(self):
@@ -223,7 +248,7 @@ class AllGroupsEmptyTests(unittest.TestCase):
         self.assertTrue(result['confirmed_empty'])
 
 
-class SuccessKeyContractTests(unittest.TestCase):
+class SuccessKeyContractTests(CredentialFixture):
     """上层只认 success，任何「成功但没商品」的返回都必须带齐字段。"""
 
     REQUIRED = (

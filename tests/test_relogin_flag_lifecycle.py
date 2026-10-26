@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch
 from XianyuAutoAsync import XianyuLive
 from utils.account_browser.tokens import BrowserToken, TokenStore
+from utils import risk_control
 
 
 class ReloginFlagLifecycleTests(unittest.IsolatedAsyncioTestCase):
@@ -17,6 +18,10 @@ class ReloginFlagLifecycleTests(unittest.IsolatedAsyncioTestCase):
         p = patch('utils.account_browser.tokens.tokens', self.store)
         p.start()
         self.addCleanup(p.stop)
+        p=patch('utils.account_browser.credentials.tokens', self.store)
+        p.start(); self.addCleanup(p.stop)
+        p=patch('utils.risk_control.registry', risk_control.RiskControlRegistry())
+        p.start(); self.addCleanup(p.stop)
 
     async def test_waiting_does_not_claim_session_expired(self):
         self.assertIsNone(await self.live.refresh_token())

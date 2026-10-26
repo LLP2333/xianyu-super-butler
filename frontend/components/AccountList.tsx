@@ -261,7 +261,7 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
       return { label: '已暂停', className: 'bg-gray-100 text-gray-500' };
     }
     if (account.runtime_state === 'waiting_browser') {
-      return { label: '等待网页 Token', className: 'bg-amber-100 text-amber-800' };
+      return { label: '等待网页登录', className: 'bg-amber-100 text-amber-800' };
     }
     if (account.runtime_state === 'running') {
       return { label: '监听中', className: 'bg-green-100 text-green-700' };
@@ -269,7 +269,7 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
     // 登录态过期时，需要在原生浏览器重新登录。
     // 与「连接中」分开显示，否则用户会一直等一个不会变好的状态。
     if (account.runtime_state === 'manual') {
-      return { label: '人工操作中', className: 'bg-amber-100 text-amber-800' };
+      return { label: '等待新凭据', className: 'bg-amber-100 text-amber-800' };
     }
     if (account.runtime_state === 'need_relogin') {
       return { label: '需重新登录', className: 'bg-red-100 text-red-700' };
@@ -292,14 +292,14 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
       {riskBlocked.length > 0 && (
         <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
           <p className="text-sm font-bold text-amber-900">
-            闲鱼要求人机验证，{riskBlocked.length} 个账号无法获取令牌
+            登录凭据待更新，{riskBlocked.length} 个账号已暂停请求
           </p>
           <p className="mt-1 text-xs leading-5 text-amber-800">
             {riskBlocked.map(item => `${item.cookie_id}：${item.verification_message || '平台风控'}`).join('；')}。
             {/* 只有本地熔断中才有确切的恢复时间；闲鱼侧的验证要求要靠过验证解除，
                 写死「N 分钟后恢复」会让用户干等一个不会自动好的状态 */}
             {riskBlocked.some(a => a.verification_required) ? (
-              <> 自动重试已停止。请打开原生浏览器，在闲鱼消息页完成验证；捕获 Token 后点「采用网页 Token 并恢复」。</>
+              <> 自动重试已停止。请打开原生浏览器，在闲鱼消息页完成验证；捕获有效 Cookie 和消息 Token 后会自动保存并恢复。</>
             ) : riskBlocked.some(a => a.blocked) ? (
               <>
                 {' '}系统会自动退避并重试，预计
@@ -413,7 +413,7 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
                 {account.runtime_state === 'need_relogin' && (
                   <p className="mt-2 rounded-md bg-red-50 px-3 py-2 text-xs leading-5 text-red-700">
                     闲鱼登录态已过期，请打开下方原生浏览器重新登录
-                    使用同一个闲鱼账号登录，捕获网页 Token 后确认恢复。
+                    使用同一个闲鱼账号登录，捕获有效 Cookie 和消息 Token 后自动恢复。
                   </p>
                 )}
 

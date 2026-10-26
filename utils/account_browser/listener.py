@@ -85,8 +85,9 @@ class TokenListener:
             token, device, app_key = parsed
             value = BrowserToken(request_account, token, device, app_key, cookies)
             tokens.observe(self.account_id, value)
-            if self.on_capture:
-                await self.on_capture(value)
+            candidate = tokens.get(self.account_id, candidate=True)
+            if self.on_capture and candidate and candidate.token == value.token:
+                await self.on_capture(candidate)
             self.error = None
         except asyncio.CancelledError:
             raise

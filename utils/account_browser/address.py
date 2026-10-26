@@ -10,7 +10,7 @@ def validate_desktop_address(value):
         url = urlsplit(value)
         valid = (url.scheme == 'https' and url.hostname and not url.username and not url.password
                  and url.path in ('', '/') and not url.query and not url.fragment
-                 and not any(c.isspace() for c in value) and not any(c in value for c in ('\\', '<', '>')))
+                 and not any(c.isspace() for c in value) and not any(c in value for c in ('\\', '<', '>', '?', '#')))
         url.port
     except ValueError:
         valid = False

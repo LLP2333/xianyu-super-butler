@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { accountBrowserAction, accountBrowserStatus, BrowserDesktop, setupBrowserAccount,
-  browserSetupStatus, browserDesktopLink, clearBrowserData, reconnectBrowserListener, BrowserListenerStatus } from '../services/api';
+import { accountBrowserAction, accountBrowserStatus, BrowserDesktop, BrowserStatus, setupBrowserAccount,
+  browserSetupStatus, browserDesktopLink, clearBrowserData, reconnectBrowserListener } from '../services/api';
 import { confirmAction } from '../services/feedback';
 import { AccountDetail } from '../types';
 
@@ -15,89 +15,64 @@ type Props = { account?: AccountDetail; initialWindow?: Window | null; onClose: 
 export default function AccountBrowser({ account, initialWindow, onClose, onChanged }: Props) {
   const [desktop, setDesktop] = useState<BrowserDesktop | null>(null);
   const [message, setMessage] = useState('正在准备原生浏览器…');
-  const [status, setStatus] = useState('等待网页消息 Token');
-  const [captured, setCaptured] = useState(false);
+  const [status, setStatus] = useState<BrowserStatus | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
   const [busy, setBusy] = useState(true);
-  const [manual, setManual] = useState(false);
-  const [created, setCreated] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [captureTime, setCaptureTime] = useState<string | null>(null);
-  const [listenerState, setListenerState] = useState<BrowserListenerStatus['listener_state'] | 'unknown'>('connecting');
-  const [listenerError, setListenerError] = useState<string | null>(null);
   const [reconnecting, setReconnecting] = useState(false);
-  const updateListener = (result: BrowserListenerStatus) => { setListenerState(result.listener_state); setListenerError(result.listener_error || null); };
+  const [createdId, setCreatedId] = useState<string>();
+  const accountId = account?.id || createdId;
   const windowRef = useRef(initialWindow);
+  const previousState = useRef<string>();
 
   useEffect(() => {
     let cancelled = false;
-    setBusy(true);
-    setCaptured(false);
-    setSaved(false);
-    setCaptureTime(null);
-    setStatus('正在连接监听，尚未确认捕获到 Cookie 和消息 Token');
     const request = account ? accountBrowserAction(account.id, 'open') : setupBrowserAccount();
     void request.then(result => {
       if (cancelled) return;
-      setDesktop(result);
-      setManual(true);
-      setMessage(result.message);
+      setDesktop(result); setMessage(result.message);
       if (result.open_url && windowRef.current && !windowRef.current.closed) {
         windowRef.current.location.href = result.open_url;
         windowRef.current = null;
       }
       onChanged();
     }).catch(error => {
-      if (!cancelled) { setMessage(errorMessage(error)); setListenerState('disconnected'); setListenerError(errorMessage(error)); }
+      if (!cancelled) { setMessage(errorMessage(error)); setStatusError(errorMessage(error)); }
       windowRef.current?.close(); windowRef.current = null;
     }).finally(() => { if (!cancelled) setBusy(false); });
     return () => { cancelled = true; };
-    // Parent list refreshes must not recreate the browser lifecycle.
+    // List refreshes must not reopen the browser or restart the account lifecycle.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [account?.id]);
 
   useEffect(() => {
-    if (busy || !desktop) return;
+    if (busy) return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
       try {
-        if (account) {
-          const result = await accountBrowserStatus(account.id);
-          if (cancelled) return;
-          updateListener(result);
-          setCaptured(result.captured && result.listening);
-          if (result.captured && result.listening) {
-            setCaptureTime(previous => previous || new Date().toLocaleTimeString());
-          } else setCaptureTime(null);
-          setStatus(result.message);
-          setManual(result.manual);
-        } else {
-          const result = await browserSetupStatus();
-          if (cancelled) return;
-          updateListener(result);
-          setStatus(result.message);
-          if (result.account_id) {
-            setCaptureTime(previous => previous || new Date().toLocaleTimeString());
-            if (!created) onChanged();
-            setCreated(true); setManual(false); setMessage(result.message);
-          }
-        }
+        const result = accountId ? await accountBrowserStatus(accountId) : await browserSetupStatus();
+        if (cancelled) return;
+        setStatus(result); setStatusError(null);
+        if (result.account_id) setCreatedId(result.account_id);
+        const current = `${result.account_id || accountId}:${result.credentials_state}`;
+        if (current !== previousState.current) { previousState.current = current; onChanged(); }
       } catch (error) {
-        if (!cancelled) { setListenerState('unknown'); setListenerError(errorMessage(error)); setCaptured(false); setCaptureTime(null); setStatus(`无法确认捕获状态：${errorMessage(error)}`); }
+        if (!cancelled) setStatusError(errorMessage(error));
       }
       if (!cancelled) timer = setTimeout(poll, 2000);
     };
     void poll();
     return () => { cancelled = true; clearTimeout(timer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [account?.id, busy, desktop, created]);
+  }, [accountId, busy]);
 
   const reconnect = async () => {
-    setBusy(true); setReconnecting(true); setListenerState('connecting'); setListenerError(null);
+    setBusy(true); setReconnecting(true); setStatusError(null);
     try {
-      const result = await reconnectBrowserListener();
-      updateListener(result); setMessage(result.message); setCaptured(false); setCaptureTime(null);
-    } catch (error) { setListenerState('disconnected'); setListenerError(errorMessage(error)); }
+      const result = desktop ? await reconnectBrowserListener()
+        : accountId ? await accountBrowserAction(accountId, 'open') : await setupBrowserAccount();
+      setDesktop(result); setMessage(result.message); setStatus(null);
+    } catch (error) { setStatusError(errorMessage(error)); }
     finally { setBusy(false); setReconnecting(false); }
   };
 
@@ -111,24 +86,20 @@ export default function AccountBrowser({ account, initialWindow, onClose, onChan
     } catch (error) { opened?.close(); setMessage(errorMessage(error)); }
   };
 
-  const act = async (action: 'restart' | 'confirm' | 'release' | 'clear') => {
+  const act = async (action: 'restart' | 'clear') => {
     if (action === 'clear' && !await confirmAction('清空浏览器的登录记录、Cookie、缓存及本地数据？账号设置保留，自动任务将暂停，需要重新登录。')) return;
-    setBusy(true);
+    setBusy(true); setStatusError(null);
     try {
-      const result = action === 'clear' ? await clearBrowserData()
-        : await accountBrowserAction(account!.id, action);
-      setMessage(result.message);
-      if (action === 'restart' || action === 'clear') {
-        setDesktop(result); setCaptured(false); setSaved(false); setCaptureTime(null); setManual(true);
-        setStatus('等待捕获 Cookie 和消息 Token，请登录闲鱼并打开或刷新消息页');
-      } else {
-        setManual(false); setCaptured(false); setSaved(action === 'confirm');
-        if (action === 'release') setCaptureTime(null);
-      }
-      onChanged();
-    } catch (error) { setMessage(errorMessage(error)); }
+      const result = action === 'clear' ? await clearBrowserData() : await accountBrowserAction(accountId!, action);
+      setDesktop(result); setMessage(result.message); setStatus(null); onChanged();
+    } catch (error) { setStatusError(errorMessage(error)); }
     finally { setBusy(false); }
   };
+
+  const listening = !busy && !statusError && status?.listener_state === 'listening';
+  const active = !busy && !statusError && status?.credentials_state === 'active';
+  const titles = { waiting: '等待网页登录并捕获凭据', captured: '已捕获 Cookie 和消息 Token，正在自动采用',
+    active: createdId ? '✓ 账号已添加，Cookie 和消息 Token 已采用' : '✓ Cookie 已保存，消息 Token 已采用', error: '凭据采用失败，账号保持暂停' };
 
   return createPortal(
     <div className="modal-overlay">
@@ -139,41 +110,28 @@ export default function AccountBrowser({ account, initialWindow, onClose, onChan
         </div>
         <div className="p-5 space-y-4">
           <p role="status">{message}</p>
-          <div role="status" aria-live="polite" className={`rounded-xl border p-3 ${listenerState === 'listening' ? 'border-green-200 text-green-800' : 'border-amber-200 text-amber-800'}`}>
-            <p className="font-bold">浏览器监听：{{ connecting: reconnecting ? '重新连接中…' : '正在连接…', listening: '监听中', disconnected: '已断开', unknown: '状态查询失败' }[listenerState]}</p>
-            <p className="text-sm">{listenerError || (listenerState === 'listening' ? '监听连接正常，正在接收网页登录结果，无需重新连接。' : '连接异常时可点击下方“重新连接监听”，无需重启浏览器。')}</p>
+          <div role="status" aria-live="polite" className={`rounded-xl border p-3 ${listening ? 'border-green-200 text-green-800' : 'border-amber-200 text-amber-800'}`}>
+            <p className="font-bold">浏览器监听：{busy ? reconnecting ? '重新连接中…' : '正在连接…' : statusError ? '状态查询失败' : status?.listener_state === 'listening' ? '监听中' : status?.listener_state === 'connecting' ? '正在连接…' : '已断开'}</p>
+            <p className="text-sm">{statusError || status?.listener_error || (listening ? '监听连接正常，正在接收网页登录结果，无需重新连接。' : '连接异常时可点击“重新连接监听”，无需重启浏览器。')}</p>
           </div>
-          <div role="status" aria-live="polite" aria-atomic="true"
-            className={`rounded-xl border p-4 space-y-2 ${captured || saved || created
-              ? 'border-green-200 bg-green-50 text-green-800'
-              : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
-            <p className="font-bold">{created ? '✓ Cookie 和消息 Token 已捕获，账号已添加'
-              : saved ? '✓ Cookie 已保存，消息 Token 已采用'
-              : captured ? '✓ Cookie 和消息 Token 已捕获'
-              : manual || busy ? '等待捕获 Cookie 和消息 Token' : '操作已结束，本次未更新登录状态'}</p>
-            {captureTime && <p className="text-sm">本窗口确认捕获时间：{captureTime}</p>}
-            <p className="text-sm">{created ? message
-              : saved ? '账号任务已恢复，可关闭窗口；实际消息连接结果请查看账号列表。'
-              : captured ? '登录凭证已就绪，请点击下方“采用网页 Token 并恢复”完成保存。'
-              : manual || busy ? status : '再次点击“重新连接监听”可继续捕获。'}</p>
-            {(manual || busy) && !captured && <p className="text-sm">在原生 Chrome 登录后，打开或刷新闲鱼消息页；这里每 2 秒自动检查一次。</p>}
+          <div role="status" aria-live="polite" aria-atomic="true" className={`rounded-xl border p-4 space-y-2 ${active ? 'border-green-200 bg-green-50 text-green-800' : 'border-amber-200 bg-amber-50 text-amber-800'}`}>
+            <p className="font-bold">{statusError ? '暂时无法确认凭据状态' : busy || !status ? '正在检查登录凭据…' : titles[status.credentials_state]}</p>
+            {status?.captured_at && <p className="text-sm">消息 Token 首次捕获时间：{new Date(status.captured_at * 1000).toLocaleString()}</p>}
+            <p className="text-sm">{statusError ? '当前状态无法确认，请等待查询恢复。' : status?.message || '在原生 Chrome 登录闲鱼，然后打开或刷新消息页。'}</p>
+            <p className="text-sm">{active ? '账号任务已恢复，实际消息连接结果请查看账号列表。' : '系统每 2 秒刷新状态；捕获有效凭据后会自动保存并恢复，无需手动确认。'}</p>
           </div>
           {desktop?.desktop_url && <>
             <button type="button" className="ios-btn-primary px-4 py-2" disabled={busy} onClick={() => void openDesktop()}>打开原生 Chrome 桌面 ↗</button>
             <p className="text-sm break-all">桌面地址：{desktop.desktop_url}（点击上方按钮自动授权，无需输入桌面密码）</p>
-            <p className="text-sm text-gray-500">在 Chrome 内登录闲鱼，然后打开 https://www.goofish.com/im。{account ? '验证完成并捕获 Token 后，回到这里确认。' : '捕获 Cookie 和消息 Token 后，系统会自动添加账号。'}</p>
+            <p className="text-sm text-gray-500">在 Chrome 内登录闲鱼，然后打开 https://www.goofish.com/im。请使用当前账号，系统自动捕获 Cookie 和消息 Token。</p>
             <p className="text-sm text-gray-500">若出现自签名证书提示，请核对桌面地址。打开链接一分钟内有效，过期后请重新点击按钮。</p>
           </>}
-          <p className="text-sm text-gray-500">{account ? '人工操作期间账号任务暂停，关闭本窗口不会自动恢复。' : '当前先使用一个账号，完成登录后可在账号列表查看连接状态。'}</p>
+          <p className="text-sm text-gray-500">凭据过期后暂停闲鱼请求。关闭此窗口不会停止监听，也不会提前恢复任务；新凭据采用成功后才恢复。</p>
         </div>
         <div className="modal-footer flex flex-wrap gap-2">
-          <button type="button" className="ios-btn-secondary px-3 py-2" disabled={busy || listenerState === 'listening'} onClick={() => void reconnect()}>{reconnecting ? '重新连接中…' : listenerState === 'listening' ? '监听正常' : '重新连接监听'}</button>
-          <button type="button" className="ios-btn-secondary px-3 py-2 text-red-600" disabled={busy || created} onClick={() => void act('clear')}>清空浏览器数据</button>
-          {account && <>
-            <button type="button" className="ios-btn-secondary px-3 py-2" disabled={busy || !manual} onClick={() => void act('restart')}>重启浏览器</button>
-            <button type="button" className="ios-btn-secondary px-3 py-2" disabled={busy || !manual} onClick={() => void act('release')}>结束操作（不更新）</button>
-            <button type="button" className="ios-btn-primary px-3 py-2" disabled={busy || !manual || !captured} onClick={() => void act('confirm')}>采用网页 Token 并恢复</button>
-          </>}
+          <button type="button" className="ios-btn-secondary px-3 py-2" disabled={busy || listening} onClick={() => void reconnect()}>{reconnecting ? '重新连接中…' : listening ? '监听正常' : '重新连接监听'}</button>
+          <button type="button" className="ios-btn-secondary px-3 py-2 text-red-600" disabled={busy || !desktop} onClick={() => void act('clear')}>清空浏览器数据</button>
+          {accountId && <button type="button" className="ios-btn-secondary px-3 py-2" disabled={busy} onClick={() => void act('restart')}>重启浏览器</button>}
         </div>
       </div>
     </div>, document.body,

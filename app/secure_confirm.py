@@ -3,6 +3,8 @@
 用于处理订单的自动确认发货流程。
 """
 
+from utils.account_browser.credentials import platform_request
+from utils.risk_control import RiskControlBlocked
 import asyncio
 import time
 from loguru import logger
@@ -71,15 +73,6 @@ class SecureConfirm:
             logger.error(f"【{self.cookie_id}】获取真实商品ID失败: {self._safe_str(e)}")
             return None
 
-    async def _update_config_cookies(self):
-        """更新数据库中的Cookie配置"""
-        try:
-            from app.db_manager import db_manager
-            # 更新数据库中的cookies
-            db_manager.update_cookie_account_info(self.cookie_id, cookie_value=self.cookies_str)
-            logger.debug(f"【{self.cookie_id}】已更新数据库中的Cookie")
-        except Exception as e:
-            logger.error(f"【{self.cookie_id}】更新数据库Cookie失败: {self._safe_str(e)}")
 
 
     async def auto_confirm(self, order_id, item_id=None, retry_count=0):
@@ -129,29 +122,14 @@ class SecureConfirm:
 
         try:
             logger.info(f"【{self.cookie_id}】开始自动确认发货，订单ID: {order_id}")
-            async with self.session.post(
-                'https://h5api.m.goofish.com/h5/mtop.taobao.idle.logistic.consign.dummy/1.0/',
+            async with platform_request(self.session, self.cookie_id, 'post', cookies=self.cookies_str,
+                url='https://h5api.m.goofish.com/h5/mtop.taobao.idle.logistic.consign.dummy/1.0/',
                 params=params,
                 data=data
             ) as response:
                 res_json = await response.json()
 
                 # 检查并更新Cookie
-                if 'set-cookie' in response.headers:
-                    new_cookies = {}
-                    for cookie in response.headers.getall('set-cookie', []):
-                        if '=' in cookie:
-                            name, value = cookie.split(';')[0].split('=', 1)
-                            new_cookies[name.strip()] = value.strip()
-
-                    # 更新cookies
-                    if new_cookies:
-                        self.cookies.update(new_cookies)
-                        # 生成新的cookie字符串
-                        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                        # 更新数据库中的Cookie
-                        await self._update_config_cookies()
-                        logger.debug("已更新Cookie到数据库")
 
                 logger.info(f"【{self.cookie_id}】自动确认发货响应: {res_json}")
 
@@ -166,6 +144,8 @@ class SecureConfirm:
                     return await self.auto_confirm(order_id, item_id, retry_count + 1)
 
 
+        except RiskControlBlocked as exc:
+            return {"error": str(exc), "waiting_browser": True}
         except Exception as e:
             logger.error(f"【{self.cookie_id}】自动确认发货API请求异常: {self._safe_str(e)}")
             await asyncio.sleep(0.5)

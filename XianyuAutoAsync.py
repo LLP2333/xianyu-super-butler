@@ -1,3 +1,5 @@
+from utils.account_browser.credentials import platform_request, require_credentials, invalidate_credentials
+from utils.risk_control import RiskControlBlocked
 import asyncio
 import json
 import re
@@ -284,9 +286,6 @@ class XianyuLive:
         if self.cleanup_task:
             status = "已完成" if self.cleanup_task.done() else "运行中"
             other_tasks_status.append(f"清理任务({status})")
-        if self.cookie_refresh_task:
-            status = "已完成" if self.cookie_refresh_task.done() else "运行中"
-            other_tasks_status.append(f"Cookie刷新任务({status})")
         if self.item_sync_task:
             status = "已完成" if self.item_sync_task.done() else "运行中"
             other_tasks_status.append(f"商品同步任务({status})")
@@ -334,11 +333,6 @@ class XianyuLive:
                 else:
                     logger.debug(f"【{self.cookie_id}】清理任务已完成，跳过")
                     
-            if self.cookie_refresh_task:
-                if not self.cookie_refresh_task.done():
-                    tasks_to_cancel.append(("Cookie刷新任务", self.cookie_refresh_task))
-                else:
-                    logger.debug(f"【{self.cookie_id}】Cookie刷新任务已完成，跳过")
 
             if self.item_sync_task:
                 if not self.item_sync_task.done():
@@ -376,7 +370,6 @@ class XianyuLive:
                 self.heartbeat_task = None
                 self.token_refresh_task = None
                 self.cleanup_task = None
-                self.cookie_refresh_task = None
                 self.item_sync_task = None
                 self.order_sync_task = None
                 self.item_polish_task = None
@@ -515,7 +508,6 @@ class XianyuLive:
             self.heartbeat_task = None
             self.token_refresh_task = None
             self.cleanup_task = None
-            self.cookie_refresh_task = None
             self.item_sync_task = None
             self.order_sync_task = None
             self.item_polish_task = None
@@ -794,11 +786,6 @@ class XianyuLive:
         self.cleanup_task = None
 
         # Cookie刷新定时任务
-        self.cookie_refresh_task = None
-        self.cookie_refresh_interval = 1200  # 1小时 = 3600秒
-        self.last_cookie_refresh_time = 0
-        self.cookie_refresh_lock = asyncio.Lock()  # 使用Lock防止重复执行Cookie刷新
-        self.cookie_refresh_enabled = True  # 是否启用Cookie刷新功能
 
         # 商品同步定时任务
         self.item_sync_task = None
@@ -833,15 +820,11 @@ class XianyuLive:
         self._buyer_interaction_triggering = False
 
         # 扫码登录Cookie刷新标志
-        self.last_qr_cookie_refresh_time = 0  # 记录上次扫码登录Cookie刷新时间
-        self.qr_cookie_refresh_cooldown = 600  # 扫码登录Cookie刷新后的冷却时间：10分钟
 
         # 消息接收标识 - 用于控制Cookie刷新
         self.last_message_received_time = 0  # 记录上次收到消息的时间
-        self.message_cookie_refresh_cooldown = 300  # 收到消息后5分钟内不执行Cookie刷新
 
         # 浏览器Cookie刷新成功标志
-        self.browser_cookie_refreshed = False  # 标记_refresh_cookies_via_browser是否成功更新过数据库
         self.restarted_in_browser_refresh = False  # 刷新流程内部是否已触发重启（用于去重）
 
 
@@ -953,27 +936,6 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】获取自动确认发货设置失败: {self._safe_str(e)}")
             return True  # 出错时默认启用
 
-    async def _merge_mtop_response_cookies(self, response, source: str) -> None:
-        """合并 mtop 响应中的 Cookie，并同步到当前会话和数据库。"""
-        if 'set-cookie' not in response.headers:
-            return
-
-        new_cookies = {}
-        for cookie in response.headers.getall('set-cookie', []):
-            if '=' not in cookie:
-                continue
-            name, value = cookie.split(';', 1)[0].split('=', 1)
-            new_cookies[name.strip()] = value.strip()
-
-        if not new_cookies:
-            return
-
-        self.cookies.update(new_cookies)
-        self.cookies_str = '; '.join(f"{key}={value}" for key, value in self.cookies.items())
-        if self.session and not self.session.closed:
-            self.session.headers['cookie'] = self.cookies_str
-        await self.update_config_cookies()
-        logger.info(f"【{self.cookie_id}】{source}响应更新了 {len(new_cookies)} 个 Cookie 字段")
 
     async def fetch_buyer_rating_count(self, buyer_id: str, retry_count: int = 0) -> int:
         """获取买家被评价总数；失败返回 -1，由规则引擎按放行处理。"""
@@ -1021,15 +983,14 @@ class XianyuLive:
         }
 
         try:
-            async with self.session.post(
-                'https://h5api.m.goofish.com/h5/mtop.idle.web.trade.rate.list/1.0/',
+            async with platform_request(self.session, self.cookie_id, 'post', cookies=self.cookies_str,
+                url='https://h5api.m.goofish.com/h5/mtop.idle.web.trade.rate.list/1.0/',
                 params=params,
                 data={'data': data_val},
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as response:
                 result = await response.json()
-                await self._merge_mtop_response_cookies(response, "买家信用查询")
 
             ret_list = result.get('ret', []) if isinstance(result, dict) else []
             if any('SUCCESS' in value for value in ret_list):
@@ -1048,6 +1009,8 @@ class XianyuLive:
                 logger.warning(
                     f"【{self.cookie_id}】买家信用查询失败: buyer_id={buyer_id}, ret={ret_list}"
                 )
+        except RiskControlBlocked as exc:
+            return -1
         except Exception as exc:
             logger.warning(
                 f"【{self.cookie_id}】买家信用查询异常（第 {retry_count + 1} 次）: "
@@ -1102,15 +1065,14 @@ class XianyuLive:
         }
 
         try:
-            async with self.session.post(
-                'https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.close.by.seller/2.0/',
+            async with platform_request(self.session, self.cookie_id, 'post', cookies=self.cookies_str,
+                url='https://h5api.m.goofish.com/h5/mtop.taobao.idle.trade.merchant.close.by.seller/2.0/',
                 params=params,
                 data={'data': data_val},
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=20),
             ) as response:
                 result = await response.json()
-                await self._merge_mtop_response_cookies(response, "关闭订单")
 
             ret_list = result.get('ret', []) if isinstance(result, dict) else []
             if any('SUCCESS' in value for value in ret_list):
@@ -1120,6 +1082,8 @@ class XianyuLive:
                 f"【{self.cookie_id}】关闭订单失败（第 {retry_count + 1} 次）: "
                 f"order_id={order_id}, ret={ret_list}"
             )
+        except RiskControlBlocked as exc:
+            return {'error': str(exc), 'waiting_browser': True}
         except Exception as exc:
             logger.warning(
                 f"【{self.cookie_id}】关闭订单异常（第 {retry_count + 1} 次）: "
@@ -2070,6 +2034,13 @@ class XianyuLive:
         if not value or value.account != self.myid:
             self.current_token = None
             self.last_token_refresh_status = 'waiting_browser_token'
+            invalidate_credentials(self.cookie_id, '凭据已失效，等待原生浏览器提供新凭据')
+            return None
+        try:
+            require_credentials(self.cookie_id)
+        except RiskControlBlocked:
+            self.current_token = None
+            self.last_token_refresh_status = 'waiting_browser_token'
             return None
         self.current_token = value.token
         self.device_id = value.device_id
@@ -2099,7 +2070,7 @@ class XianyuLive:
         """Stop automatic attempts; the account browser owns manual verification."""
         from utils import risk_control
         from app.db_manager import db_manager
-        reason = '闲鱼要求滑块验证，请打开账号浏览器完成人工验证并确认登录'
+        reason = '闲鱼要求滑块验证，请打开账号浏览器完成人工验证并打开消息页，捕获成功后自动恢复'
         risk_control.registry.get(self.cookie_id).require_verification(reason)
         self.last_token_refresh_status = 'manual_verification_required'
         try:
@@ -2111,163 +2082,7 @@ class XianyuLive:
         except Exception as exc:
             logger.warning(f'【{self.cookie_id}】记录人工验证提示失败: {type(exc).__name__}')
 
-    async def _update_cookies_and_restart(self, new_cookies_str: str):
-        """更新cookies并重启任务"""
-        try:
-            logger.info(f"【{self.cookie_id}】开始更新cookies并重启任务...")
 
-            # 验证新cookies的有效性
-            if not new_cookies_str or not new_cookies_str.strip():
-                logger.error(f"【{self.cookie_id}】新cookies为空，无法更新")
-                return False
-
-            # 解析新cookies，确保格式正确
-            try:
-                new_cookies_dict = trans_cookies(new_cookies_str)
-                if not new_cookies_dict:
-                    logger.error(f"【{self.cookie_id}】新cookies解析失败，无法更新")
-                    return False
-                logger.info(f"【{self.cookie_id}】新cookies解析成功，包含 {len(new_cookies_dict)} 个字段")
-            except Exception as parse_e:
-                logger.error(f"【{self.cookie_id}】新cookies解析异常: {self._safe_str(parse_e)}")
-                return False
-
-            # 合并cookies：保留原有cookies，只更新新获取到的字段
-            try:
-                # 获取当前的cookies字典
-                current_cookies_dict = trans_cookies(self.cookies_str)
-                logger.info(f"【{self.cookie_id}】当前cookies包含 {len(current_cookies_dict)} 个字段")
-
-                # 合并cookies：新cookies覆盖旧cookies中的相同字段
-                merged_cookies_dict = current_cookies_dict.copy()
-                updated_fields = []
-
-                for key, value in new_cookies_dict.items():
-                    if key in merged_cookies_dict:
-                        if merged_cookies_dict[key] != value:
-                            merged_cookies_dict[key] = value
-                            updated_fields.append(key)
-                    else:
-                        merged_cookies_dict[key] = value
-                        updated_fields.append(f"{key}(新增)")
-
-                if updated_fields:
-                    logger.info(f"【{self.cookie_id}】更新的cookie字段: {', '.join(updated_fields)}")
-                else:
-                    logger.info(f"【{self.cookie_id}】没有cookie字段需要更新")
-
-                # 重新组装cookies字符串
-                merged_cookies_str = '; '.join([f"{k}={v}" for k, v in merged_cookies_dict.items()])
-                logger.info(f"【{self.cookie_id}】合并后cookies包含 {len(merged_cookies_dict)} 个字段")
-                
-                # 打印合并后的Cookie字段详情
-                logger.info(f"【{self.cookie_id}】========== 合并后Cookie字段详情 ==========")
-                logger.info(f"【{self.cookie_id}】Cookie字段数: {len(merged_cookies_dict)}")
-                logger.info(f"【{self.cookie_id}】Cookie字段列表:")
-                for i, (key, value) in enumerate(merged_cookies_dict.items(), 1):
-                    if len(str(value)) > 50:
-                        logger.info(f"【{self.cookie_id}】  {i:2d}. {key}: {str(value)[:30]}...{str(value)[-20:]} (长度: {len(str(value))})")
-                    else:
-                        logger.info(f"【{self.cookie_id}】  {i:2d}. {key}: {value}")
-                
-                # 检查关键字段
-                important_keys = ['unb', '_m_h5_tk', '_m_h5_tk_enc', 'cookie2', 't', 'sgcookie', 'cna']
-                logger.info(f"【{self.cookie_id}】关键字段检查:")
-                for key in important_keys:
-                    if key in merged_cookies_dict:
-                        val = merged_cookies_dict[key]
-                        logger.info(f"【{self.cookie_id}】  ✅ {key}: {'存在' if val else '为空'} (长度: {len(str(val)) if val else 0})")
-                    else:
-                        logger.info(f"【{self.cookie_id}】  ❌ {key}: 缺失")
-                logger.info(f"【{self.cookie_id}】==========================================")
-
-                # 使用合并后的cookies字符串
-                new_cookies_str = merged_cookies_str
-                new_cookies_dict = merged_cookies_dict
-
-            except Exception as merge_e:
-                logger.error(f"【{self.cookie_id}】cookies合并异常: {self._safe_str(merge_e)}")
-                logger.warning(f"【{self.cookie_id}】将使用原始新cookies（不合并）")
-                # 如果合并失败，继续使用原始的new_cookies_str
-
-            # 备份原有cookies，以防更新失败需要回滚
-            old_cookies_str = self.cookies_str
-            old_cookies_dict = self.cookies.copy()
-
-            try:
-                # 更新当前实例的cookies
-                self.cookies_str = new_cookies_str
-                self.cookies = new_cookies_dict
-
-                # 更新数据库中的cookies
-                await self.update_config_cookies()
-                logger.info(f"【{self.cookie_id}】数据库cookies更新成功")
-
-                # 通过CookieManager重启任务
-                logger.info(f"【{self.cookie_id}】通过CookieManager重启任务...")
-                await self._restart_instance()
-                
-                # ⚠️ _restart_instance() 已触发重启，当前任务即将被取消
-                # 立即返回，不执行后续代码
-                logger.info(f"【{self.cookie_id}】cookies更新成功，重启请求已触发")
-                return True
-
-            except Exception as update_e:
-                logger.error(f"【{self.cookie_id}】更新cookies过程中出错，尝试回滚: {self._safe_str(update_e)}")
-
-                # 回滚cookies
-                try:
-                    self.cookies_str = old_cookies_str
-                    self.cookies = old_cookies_dict
-                    await self.update_config_cookies()
-                    logger.info(f"【{self.cookie_id}】cookies已回滚到原始状态")
-                except Exception as rollback_e:
-                    logger.error(f"【{self.cookie_id}】cookies回滚失败: {self._safe_str(rollback_e)}")
-
-                return False
-
-        except Exception as e:
-            logger.error(f"【{self.cookie_id}】更新cookies并重启任务时出错: {self._safe_str(e)}")
-            return False
-
-    async def update_config_cookies(self):
-        """更新数据库中的cookies（不会覆盖账号密码等其他字段）"""
-        try:
-            from app.db_manager import db_manager
-
-            # 更新数据库中的Cookie
-            if hasattr(self, 'cookie_id') and self.cookie_id:
-                try:
-                    # 获取当前Cookie的用户ID，避免在刷新时改变所有者
-                    current_user_id = None
-                    if hasattr(self, 'user_id') and self.user_id:
-                        current_user_id = self.user_id
-
-                    # 使用 update_cookie_account_info 避免覆盖其他字段（如 pause_duration、remark 等）
-                    # 这个方法会自动处理新账号和现有账号的情况，不会覆盖账号密码
-                    success = db_manager.update_cookie_account_info(
-                        self.cookie_id, 
-                        cookie_value=self.cookies_str,
-                        user_id=current_user_id  # 如果是新账号，需要提供user_id
-                    )
-                    if not success:
-                        # 如果更新失败，记录错误但不使用 save_cookie（避免覆盖账号密码）
-                        logger.warning(f"更新Cookie到数据库失败: {self.cookie_id}，但不使用save_cookie避免覆盖账号密码")
-                    else:
-                        logger.warning(f"已更新Cookie到数据库: {self.cookie_id}")
-                except Exception as e:
-                    logger.error(f"更新数据库Cookie失败: {self._safe_str(e)}")
-                    # 发送数据库更新失败通知
-                    await self.send_token_refresh_notification(f"数据库Cookie更新失败: {str(e)}", "db_update_failed")
-            else:
-                logger.warning("Cookie ID不存在，无法更新数据库")
-                # 发送Cookie ID缺失通知
-                await self.send_token_refresh_notification("Cookie ID不存在，无法更新数据库", "cookie_id_missing")
-
-        except Exception as e:
-            logger.error(f"更新Cookie失败: {self._safe_str(e)}")
-            # 发送Cookie更新失败通知
-            await self.send_token_refresh_notification(f"Cookie更新失败: {str(e)}", "cookie_update_failed")
 
     async def _verify_cookie_validity(self) -> dict:
         """验证Cookie的有效性，通过实际调用API测试
@@ -2391,7 +2206,7 @@ class XianyuLive:
                 
                 # 创建图片上传实例
                 from utils.image_uploader import ImageUploader
-                uploader = ImageUploader(cookies_str=self.cookies_str)
+                uploader = ImageUploader(self.cookie_id, self.cookies_str)
                 
                 # 创建session
                 await uploader.create_session()
@@ -3377,29 +3192,14 @@ class XianyuLive:
         params['sign'] = sign
 
         try:
-            async with self.session.post(
-                'https://h5api.m.goofish.com/h5/mtop.taobao.idle.pc.detail/1.0/',
+            async with platform_request(self.session, self.cookie_id, 'post', cookies=self.cookies_str,
+                url='https://h5api.m.goofish.com/h5/mtop.taobao.idle.pc.detail/1.0/',
                 params=params,
                 data=data
             ) as response:
                 res_json = await response.json()
 
                 # 检查并更新Cookie
-                if 'set-cookie' in response.headers:
-                    new_cookies = {}
-                    for cookie in response.headers.getall('set-cookie', []):
-                        if '=' in cookie:
-                            name, value = cookie.split(';')[0].split('=', 1)
-                            new_cookies[name.strip()] = value.strip()
-
-                    # 更新cookies
-                    if new_cookies:
-                        self.cookies.update(new_cookies)
-                        # 生成新的cookie字符串
-                        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                        # 更新数据库中的Cookie
-                        await self.update_config_cookies()
-                        logger.warning("已更新Cookie到数据库")
 
                 logger.warning(f"商品信息获取成功: {res_json}")
                 # 检查返回状态
@@ -3418,6 +3218,8 @@ class XianyuLive:
                     logger.error(f"商品信息API返回格式异常: {res_json}")
                     return await self.get_item_info(item_id, retry_count + 1)
 
+        except RiskControlBlocked as exc:
+            return {'error': str(exc), 'waiting_browser': True}
         except Exception as e:
             logger.error(f"商品信息API请求异常: {self._safe_str(e)}")
             await asyncio.sleep(0.5)
@@ -3725,7 +3527,7 @@ class XianyuLive:
 
                     # 使用图片上传器上传到闲鱼CDN
                     from utils.image_uploader import ImageUploader
-                    uploader = ImageUploader(self.cookies_str)
+                    uploader = ImageUploader(self.cookie_id, self.cookies_str)
 
                     async with uploader:
                         cdn_url = await uploader.upload_image(local_image_path)
@@ -5745,6 +5547,12 @@ class XianyuLive:
                     await self.ws.close()
                 return
 
+    async def _send_account_frame(self, ws, payload):
+        value = require_credentials(self.cookie_id)
+        if value.token != self.current_token:
+            raise RuntimeError('消息凭据已更新，等待新连接')
+        await ws.send(payload)
+
     async def create_chat(self, ws, toid, item_id='891198795482'):
         msg = {
             "lwp": "/r/SingleChatConversation/create",
@@ -5766,7 +5574,7 @@ class XianyuLive:
                 }
             ]
         }
-        await ws.send(json.dumps(msg))
+        await self._send_account_frame(ws, json.dumps(msg))
 
     async def send_msg(self, ws, cid, toid, text):
         text = {
@@ -5812,7 +5620,7 @@ class XianyuLive:
                 }
             ]
         }
-        await ws.send(json.dumps(msg))
+        await self._send_account_frame(ws, json.dumps(msg))
 
     def _resolve_im_response(self, message_data):
         """Resolve a pending IM request when the server echoes its mid."""
@@ -5860,7 +5668,7 @@ class XianyuLive:
         async with self._im_request_lock:
             self._im_pending[mid] = future
             try:
-                await websocket.send(json.dumps({
+                await self._send_account_frame(websocket, json.dumps({
                     "lwp": lwp,
                     "headers": {"mid": mid},
                     "body": body,
@@ -5946,7 +5754,7 @@ class XianyuLive:
     async def init(self, ws):
         await self.refresh_token()
         if not self.current_token:
-            raise RuntimeError('等待网页消息 Token，请在原生浏览器打开闲鱼消息页并确认')
+            raise RuntimeError('等待网页消息 Token，请在原生浏览器打开闲鱼消息页')
 
         msg = {
             "lwp": "/reg",
@@ -5962,7 +5770,7 @@ class XianyuLive:
                 "mid": generate_mid()
             }
         }
-        await ws.send(json.dumps(msg))
+        await self._send_account_frame(ws, json.dumps(msg))
         registration_mid = msg['headers']['mid']
         async with asyncio.timeout(20):
             while True:
@@ -5972,7 +5780,7 @@ class XianyuLive:
                 if str((response.get('headers') or {}).get('mid', '')) == str(registration_mid):
                     if str(response.get('code')) != '200':
                         from utils.account_browser.tokens import tokens
-                        tokens.reject(self.cookie_id, self.current_token)
+                        invalidate_credentials(self.cookie_id, '消息服务拒绝当前 Token，请在原生网页重新登录或刷新消息页', tokens.get(self.cookie_id))
                         self.current_token = None
                         raise RuntimeError('消息服务拒绝网页 Token，请在原生网页刷新后重试')
                     break
@@ -5996,7 +5804,7 @@ class XianyuLive:
                 }
             ]
         }
-        await ws.send(json.dumps(msg))
+        await self._send_account_frame(ws, json.dumps(msg))
         logger.info(f'【{self.cookie_id}】连接注册完成')
 
     async def send_heartbeat(self, ws):
@@ -6013,7 +5821,7 @@ class XianyuLive:
         }
         # 添加超时保护，避免在WebSocket关闭时阻塞
         try:
-            await asyncio.wait_for(ws.send(json.dumps(msg)), timeout=2.0)
+            await asyncio.wait_for(self._send_account_frame(ws, json.dumps(msg)), timeout=2.0)
             self.last_heartbeat_time = time.time()
             logger.warning(f"【{self.cookie_id}】心跳包已发送")
         except asyncio.TimeoutError:
@@ -6869,1192 +6677,33 @@ class XianyuLive:
         return {'rated': rated, 'flowered': flowered}
 
 
-    async def cookie_refresh_loop(self):
-        """Cookie刷新定时任务 - 每小时执行一次"""
-        try:
-            while True:
-                try:
-                    # 检查账号是否启用
-                    from app.cookie_manager import manager as cookie_manager
-                    if cookie_manager and not cookie_manager.get_cookie_status(self.cookie_id):
-                        logger.info(f"【{self.cookie_id}】账号已禁用，停止Cookie刷新循环")
-                        break
 
-                    # 检查Cookie刷新功能是否启用
-                    if not self.cookie_refresh_enabled:
-                        logger.warning(f"【{self.cookie_id}】Cookie刷新功能已禁用，跳过执行")
-                        await self._interruptible_sleep(300)  # 5分钟后再检查
-                        continue
 
-                    current_time = time.time()
-                    if current_time - self.last_cookie_refresh_time >= self.cookie_refresh_interval:
-                        # 检查是否在消息接收后的冷却时间内
-                        time_since_last_message = current_time - self.last_message_received_time
-                        if time_since_last_message < self.message_cookie_refresh_cooldown:
-                            remaining_time = self.message_cookie_refresh_cooldown - time_since_last_message
-                            remaining_minutes = int(remaining_time // 60)
-                            remaining_seconds = int(remaining_time % 60)
-                            logger.warning(f"【{self.cookie_id}】收到消息后冷却中，还需等待 {remaining_minutes}分{remaining_seconds}秒 才能执行Cookie刷新")
-                        # 检查是否已有Cookie刷新任务在执行
-                        elif self.cookie_refresh_lock.locked():
-                            logger.warning(f"【{self.cookie_id}】Cookie刷新任务已在执行中，跳过本次触发")
-                        else:
-                            logger.info(f"【{self.cookie_id}】开始执行Cookie刷新任务...")
-                            # 在独立的任务中执行Cookie刷新，避免阻塞主循环
-                            asyncio.create_task(self._execute_cookie_refresh(current_time))
 
-                    # 每分钟检查一次是否需要执行
-                    await self._interruptible_sleep(60)
-                except asyncio.CancelledError:
-                    # 收到取消信号，立即退出循环
-                    logger.info(f"【{self.cookie_id}】Cookie刷新循环收到取消信号，准备退出")
-                    raise
-                except Exception as e:
-                    logger.error(f"【{self.cookie_id}】Cookie刷新循环失败: {self._safe_str(e)}")
-                    # 出错后也等待1分钟再重试，使用可中断的sleep
-                    try:
-                        await self._interruptible_sleep(60)
-                    except asyncio.CancelledError:
-                        logger.info(f"【{self.cookie_id}】Cookie刷新循环在重试等待时收到取消信号，准备退出")
-                        raise
-        except asyncio.CancelledError:
-            # 确保CancelledError被正确传播
-            logger.info(f"【{self.cookie_id}】Cookie刷新循环已取消，正在退出...")
-            raise
-        finally:
-            # 确保任务能正常结束
-            logger.info(f"【{self.cookie_id}】Cookie刷新循环已退出")
 
-    async def _execute_cookie_refresh(self, current_time):
-        """独立执行Cookie刷新任务，避免阻塞主循环"""
 
-        # 使用Lock确保原子性，防止重复执行
-        async with self.cookie_refresh_lock:
-            try:
-                logger.info(f"【{self.cookie_id}】开始Cookie刷新任务，暂时暂停心跳以避免连接冲突...")
 
-                # 暂时暂停心跳任务，避免与浏览器操作冲突
-                heartbeat_was_running = False
-                if self.heartbeat_task and not self.heartbeat_task.done():
-                    heartbeat_was_running = True
-                    self.heartbeat_task.cancel()
-                    logger.warning(f"【{self.cookie_id}】已暂停心跳任务")
 
-                # 为整个Cookie刷新任务添加超时保护（3分钟，缩短时间减少影响）
-                success = await asyncio.wait_for(
-                    self._refresh_cookies_via_browser(),
-                    timeout=180.0  # 3分钟超时，减少对WebSocket的影响
-                )
 
-                # 重新启动心跳任务
-                if heartbeat_was_running and self.ws and not self.ws.closed:
-                    logger.warning(f"【{self.cookie_id}】重新启动心跳任务")
-                    self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
 
-                if success:
-                    self.last_cookie_refresh_time = current_time
-                    logger.info(f"【{self.cookie_id}】Cookie刷新任务完成，心跳已恢复")
-                    
-                    # 刷新成功后，验证Cookie有效性
-                    logger.info(f"【{self.cookie_id}】开始验证刷新后的Cookie有效性...")
-                    try:
-                        validation_result = await self._verify_cookie_validity()
-                        
-                        if not validation_result['valid']:
-                            logger.warning(f"【{self.cookie_id}】❌ Cookie验证失败: {validation_result['details']}")
-                            await self.send_token_refresh_notification(
-                                f"Cookie验证失败，请打开原生浏览器重新登录并采用网页Token\n验证详情: {validation_result['details']}",
-                                "cookie_validation_failed"
-                            )
-                        else:
-                            logger.info(f"【{self.cookie_id}】✅ Cookie验证通过: {validation_result['details']}")
-                            
-                    except Exception as verify_e:
-                        logger.error(f"【{self.cookie_id}】Cookie验证过程异常: {self._safe_str(verify_e)}")
-                        import traceback
-                        logger.error(f"【{self.cookie_id}】详细堆栈:\n{traceback.format_exc()}")
-                else:
-                    logger.warning(f"【{self.cookie_id}】Cookie刷新任务失败")
-                    # 即使失败也要更新时间，避免频繁重试
-                    self.last_cookie_refresh_time = current_time
 
-            except asyncio.TimeoutError:
-                # 超时也要更新时间，避免频繁重试
-                self.last_cookie_refresh_time = current_time
-            except Exception as e:
-                logger.error(f"【{self.cookie_id}】执行Cookie刷新任务异常: {self._safe_str(e)}")
-                # 异常也要更新时间，避免频繁重试
-                self.last_cookie_refresh_time = current_time
-            finally:
-                # 确保心跳任务恢复（如果WebSocket仍然连接）
-                if (self.ws and not self.ws.closed and
-                    (not self.heartbeat_task or self.heartbeat_task.done())):
-                    logger.info(f"【{self.cookie_id}】Cookie刷新完成，心跳任务正常运行")
-                    self.heartbeat_task = asyncio.create_task(self.heartbeat_loop(self.ws))
-
-                # 清空消息接收标志，允许下次正常执行Cookie刷新
-                self.last_message_received_time = 0
-                logger.warning(f"【{self.cookie_id}】Cookie刷新完成，已清空消息接收标志")
-
-
-
-    def enable_cookie_refresh(self, enabled: bool = True):
-        """启用或禁用Cookie刷新功能"""
-        self.cookie_refresh_enabled = enabled
-        status = "启用" if enabled else "禁用"
-        logger.info(f"【{self.cookie_id}】Cookie刷新功能已{status}")
-
-
-    async def refresh_cookies_from_qr_login(self, qr_cookies_str: str, cookie_id: str = None, user_id: int = None):
-        """使用扫码登录获取的cookie访问指定界面获取真实cookie并存入数据库
-
-        Args:
-            qr_cookies_str: 扫码登录获取的cookie字符串
-            cookie_id: 可选的cookie ID，如果不提供则使用当前实例的cookie_id
-            user_id: 可选的用户ID，如果不提供则使用当前实例的user_id
-
-        Returns:
-            bool: 成功返回True，失败返回False
-        """
-        playwright = None
-        browser = None
-        target_cookie_id = cookie_id or self.cookie_id
-        target_user_id = user_id or self.user_id
-
-        try:
-            import asyncio
-            from playwright.async_api import async_playwright
-            from utils.xianyu_utils import trans_cookies
-
-            logger.info(f"【{target_cookie_id}】开始使用扫码登录cookie获取真实cookie...")
-            logger.info(f"【{target_cookie_id}】扫码cookie长度: {len(qr_cookies_str)}")
-
-            # 解析扫码登录的cookie
-            qr_cookies_dict = trans_cookies(qr_cookies_str)
-            logger.info(
-                f"【{target_cookie_id}】扫码cookie字段数: {len(qr_cookies_dict)}, "
-                f"字段: {sorted(qr_cookies_dict.keys())}"
-            )
-
-            # Docker环境下修复asyncio子进程问题
-            is_docker = os.getenv('DOCKER_ENV') or os.path.exists('/.dockerenv')
-
-            if is_docker:
-                logger.warning(f"【{target_cookie_id}】检测到Docker环境，应用asyncio修复")
-
-                # 创建一个完整的虚拟子进程监视器
-                class DummyChildWatcher:
-                    def __enter__(self):
-                        return self
-                    def __exit__(self, *args):
-                        pass
-                    def is_active(self):
-                        return True
-                    def add_child_handler(self, *args, **kwargs):
-                        pass
-                    def remove_child_handler(self, *args, **kwargs):
-                        pass
-                    def attach_loop(self, *args, **kwargs):
-                        pass
-                    def close(self):
-                        pass
-                    def __del__(self):
-                        pass
-
-                # 创建自定义事件循环策略
-                class DockerEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
-                    def get_child_watcher(self):
-                        return DummyChildWatcher()
-
-                # 临时设置策略
-                old_policy = asyncio.get_event_loop_policy()
-                asyncio.set_event_loop_policy(DockerEventLoopPolicy())
-
-                try:
-                    # 添加超时机制，避免无限等待
-                    playwright = await asyncio.wait_for(
-                        async_playwright().start(),
-                        timeout=30.0  # 30秒超时
-                    )
-                    logger.warning(f"【{target_cookie_id}】Docker环境下Playwright启动成功")
-                except asyncio.TimeoutError:
-                    logger.error(f"【{target_cookie_id}】Docker环境下Playwright启动超时")
-                    return False
-                finally:
-                    # 恢复原策略
-                    asyncio.set_event_loop_policy(old_policy)
-            else:
-                # 非Docker环境，正常启动（也添加超时保护）
-                try:
-                    playwright = await asyncio.wait_for(
-                        async_playwright().start(),
-                        timeout=30.0  # 30秒超时
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(f"【{target_cookie_id}】Playwright启动超时")
-                    return False
-
-            # 启动浏览器（参照商品搜索的配置）
-            browser_args = [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-                '--disable-features=TranslateUI',
-                '--disable-ipc-flooding-protection',
-                '--disable-extensions',
-                '--disable-default-apps',
-                '--disable-sync',
-                '--disable-translate',
-                '--hide-scrollbars',
-                '--mute-audio',
-                '--no-default-browser-check',
-                '--no-pings'
-            ]
-
-            # 在Docker环境中添加额外参数
-            if os.getenv('DOCKER_ENV'):
-                browser_args.extend([
-                    # '--single-process',  # 注释掉，避免多用户并发时的进程冲突和资源泄漏
-                    '--disable-background-networking',
-                    '--disable-client-side-phishing-detection',
-                    '--disable-hang-monitor',
-                    '--disable-popup-blocking',
-                    '--disable-prompt-on-repost',
-                    '--disable-web-resources',
-                    '--metrics-recording-only',
-                    '--safebrowsing-disable-auto-update',
-                    '--enable-automation',
-                    '--password-store=basic',
-                    '--use-mock-keychain'
-                ])
-
-            # 优先使用Playwright自带Chromium；未安装时回退到系统Chrome/Edge。
-            bundled_executable = playwright.chromium.executable_path
-            system_browser_candidates = [
-                ("Chrome", r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-                ("Chrome", r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
-                ("Edge", r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
-                ("Edge", r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-            ]
-            launch_options = {
-                'headless': True,
-                'args': browser_args,
-            }
-
-            if os.path.exists(bundled_executable):
-                logger.info(
-                    f"【{target_cookie_id}】使用Playwright Chromium: {bundled_executable}"
-                )
-            else:
-                system_browser = next(
-                    (
-                        (name, path)
-                        for name, path in system_browser_candidates
-                        if os.path.exists(path)
-                    ),
-                    None
-                )
-                if not system_browser:
-                    logger.error(
-                        f"【{target_cookie_id}】未找到可用浏览器。"
-                        f"Playwright预期路径不存在: {bundled_executable}；"
-                        "系统Chrome/Edge也未找到。请执行: python -m playwright install chromium"
-                    )
-                    return False
-
-                browser_name, browser_path = system_browser
-                launch_options['executable_path'] = browser_path
-                logger.warning(
-                    f"【{target_cookie_id}】Playwright Chromium未安装，"
-                    f"回退使用系统{browser_name}: {browser_path}"
-                )
-
-            logger.info(f"【{target_cookie_id}】正在启动无头浏览器")
-            browser = await browser_limit.launch_browser(playwright, launch_options, "扫码登录")
-            logger.info(f"【{target_cookie_id}】无头浏览器启动成功")
-
-            # 创建浏览器上下文
-            context_options = {
-                'user_agent': CHROME_UA
-            }
-
-            # 使用标准窗口大小
-            context_options['viewport'] = {'width': 1920, 'height': 1080}
-
-            context = await browser.new_context(**context_options)
-
-            # 设置扫码登录获取的Cookie
-            cookies = []
-            for cookie_pair in qr_cookies_str.split('; '):
-                if '=' in cookie_pair:
-                    name, value = cookie_pair.split('=', 1)
-                    cookies.append({
-                        'name': name.strip(),
-                        'value': value.strip(),
-                        'domain': '.goofish.com',
-                        'path': '/'
-                    })
-
-            await context.add_cookies(cookies)
-            logger.info(
-                f"【{target_cookie_id}】已设置 {len(cookies)} 个扫码Cookie到浏览器，"
-                f"字段: {sorted(cookie['name'] for cookie in cookies)}"
-            )
-
-            # 创建页面
-            page = await context.new_page()
-
-            # 等待页面准备
-            await asyncio.sleep(0.1)
-
-            # 访问指定页面获取真实cookie
-            target_url = "https://www.goofish.com/im"
-            logger.info(f"【{target_cookie_id}】访问页面获取真实cookie: {target_url}")
-
-            # 使用更灵活的页面访问策略
-            try:
-                # 首先尝试较短超时
-                await page.goto(target_url, wait_until='domcontentloaded', timeout=15000)
-                logger.info(f"【{target_cookie_id}】页面访问成功")
-            except Exception as e:
-                if 'timeout' in str(e).lower():
-                    logger.warning(f"【{target_cookie_id}】页面访问超时，尝试降级策略...")
-                    try:
-                        # 降级策略：只等待基本加载
-                        await page.goto(target_url, wait_until='load', timeout=20000)
-                        logger.info(f"【{target_cookie_id}】页面访问成功（降级策略）")
-                    except Exception as e2:
-                        logger.warning(f"【{target_cookie_id}】降级策略也失败，尝试最基本访问...")
-                        # 最后尝试：不等待任何加载完成
-                        await page.goto(target_url, timeout=25000)
-                        logger.info(f"【{target_cookie_id}】页面访问成功（最基本策略）")
-                else:
-                    raise e
-
-            # 等待页面完全加载并获取真实cookie
-            logger.info(f"【{target_cookie_id}】页面加载完成，等待获取真实cookie...")
-            await asyncio.sleep(2)
-
-            # 执行一次刷新以确保获取最新的cookie
-            logger.info(f"【{target_cookie_id}】执行页面刷新获取最新cookie...")
-            try:
-                await page.reload(wait_until='domcontentloaded', timeout=12000)
-                logger.info(f"【{target_cookie_id}】页面刷新成功")
-            except Exception as e:
-                if 'timeout' in str(e).lower():
-                    logger.warning(f"【{target_cookie_id}】页面刷新超时，使用降级策略...")
-                    await page.reload(wait_until='load', timeout=15000)
-                    logger.info(f"【{target_cookie_id}】页面刷新成功（降级策略）")
-                else:
-                    raise e
-            await asyncio.sleep(1)
-
-            # 获取更新后的真实Cookie
-            logger.info(f"【{target_cookie_id}】获取真实Cookie...")
-            updated_cookies = await context.cookies()
-
-            # 构造新的Cookie字典
-            real_cookies_dict = {}
-            for cookie in updated_cookies:
-                real_cookies_dict[cookie['name']] = cookie['value']
-
-            # 生成真实cookie字符串
-            real_cookies_str = '; '.join([f"{k}={v}" for k, v in real_cookies_dict.items()])
-
-            logger.info(f"【{target_cookie_id}】真实Cookie已获取，包含 {len(real_cookies_dict)} 个字段")
-
-            # 检查关键字段
-            important_keys = ['unb', '_m_h5_tk', '_m_h5_tk_enc', 'cookie2', 't', 'sgcookie', 'cna']
-            key_status = []
-            for key in important_keys:
-                if key in real_cookies_dict:
-                    val = real_cookies_dict[key]
-                    key_status.append(f"{key}=存在({len(str(val)) if val else 0})")
-                else:
-                    key_status.append(f"{key}=缺失")
-            logger.info(
-                f"【{target_cookie_id}】真实Cookie摘要: 长度={len(real_cookies_str)}, "
-                f"字段={sorted(real_cookies_dict.keys())}, 关键字段=[{', '.join(key_status)}]"
-            )
-
-            # 打印原始扫码Cookie对比
-            logger.info(f"【{target_cookie_id}】=== 扫码Cookie对比 ===")
-            logger.info(f"【{target_cookie_id}】扫码Cookie长度: {len(qr_cookies_str)}")
-            logger.info(f"【{target_cookie_id}】扫码Cookie字段数: {len(qr_cookies_dict)}")
-            logger.info(f"【{target_cookie_id}】真实Cookie长度: {len(real_cookies_str)}")
-            logger.info(f"【{target_cookie_id}】真实Cookie字段数: {len(real_cookies_dict)}")
-            logger.info(f"【{target_cookie_id}】长度增加: {len(real_cookies_str) - len(qr_cookies_str)} 字符")
-            logger.info(f"【{target_cookie_id}】字段增加: {len(real_cookies_dict) - len(qr_cookies_dict)} 个")
-
-            # 检查Cookie变化
-            changed_cookies = []
-            new_cookies = []
-            for name, new_value in real_cookies_dict.items():
-                old_value = qr_cookies_dict.get(name)
-                if old_value is None:
-                    new_cookies.append(name)
-                elif old_value != new_value:
-                    changed_cookies.append(name)
-
-            # 显示Cookie变化统计
-            if changed_cookies:
-                logger.info(f"【{target_cookie_id}】发生变化的Cookie字段 ({len(changed_cookies)}个): {', '.join(changed_cookies)}")
-            if new_cookies:
-                logger.info(f"【{target_cookie_id}】新增的Cookie字段 ({len(new_cookies)}个): {', '.join(new_cookies)}")
-            if not changed_cookies and not new_cookies:
-                logger.info(f"【{target_cookie_id}】Cookie无变化")
-
-            # 保存真实Cookie到数据库
-            from app.db_manager import db_manager
-            
-            # 检查是否为新账号
-            existing_cookie = db_manager.get_cookie_details(target_cookie_id)
-            if existing_cookie:
-                # 现有账号，使用 update_cookie_account_info 避免覆盖其他字段（如 pause_duration, remark 等）
-                success = db_manager.update_cookie_account_info(target_cookie_id, cookie_value=real_cookies_str)
-            else:
-                # 新账号，使用 save_cookie
-                success = db_manager.save_cookie(target_cookie_id, real_cookies_str, target_user_id)
-
-            if success:
-                logger.info(f"【{target_cookie_id}】真实Cookie已成功保存到数据库")
-
-                # 如果当前实例的cookie_id匹配，更新实例的cookie信息
-                if target_cookie_id == self.cookie_id:
-                    self.cookies = real_cookies_dict
-                    self.cookies_str = real_cookies_str
-                    logger.info(f"【{target_cookie_id}】已更新当前实例的Cookie信息")
-
-                # 更新扫码登录Cookie刷新时间标志
-                self.last_qr_cookie_refresh_time = time.time()
-                logger.info(f"【{target_cookie_id}】已更新扫码登录Cookie刷新时间标志，_refresh_cookies_via_browser将等待{self.qr_cookie_refresh_cooldown//60}分钟后执行")
-
-                return True
-            else:
-                logger.error(f"【{target_cookie_id}】保存真实Cookie到数据库失败")
-                return False
-
-        except Exception as e:
-            logger.error(f"【{target_cookie_id}】使用扫码cookie获取真实cookie失败: {self._safe_str(e)}")
-            return False
-        finally:
-            # 确保资源清理
-            try:
-                # 先关闭浏览器，再关闭Playwright（顺序很重要）
-                if browser:
-                    try:
-                        await asyncio.wait_for(browser.close(), timeout=5.0)
-                        logger.warning(f"【{target_cookie_id}】浏览器关闭完成")
-                    except asyncio.TimeoutError:
-                        logger.warning(f"【{target_cookie_id}】浏览器关闭超时（5秒），资源可能未完全释放")
-                        # 尝试取消浏览器相关的任务
-                        try:
-                            if hasattr(browser, '_connection'):
-                                browser._connection = None
-                        except:
-                            pass
-                    except Exception as e:
-                        logger.warning(f"【{target_cookie_id}】关闭浏览器时出错: {self._safe_str(e)}")
-                
-                # Playwright关闭：使用更短的超时，超时后立即放弃
-                if playwright:
-                    try:
-                        logger.warning(f"【{target_cookie_id}】正在关闭Playwright...")
-                        await asyncio.wait_for(playwright.stop(), timeout=2.0)
-                        logger.warning(f"【{target_cookie_id}】Playwright关闭完成")
-                    except asyncio.TimeoutError:
-                        logger.warning(f"【{target_cookie_id}】Playwright关闭超时（2秒），进程可能仍在运行")
-                        logger.warning(f"【{target_cookie_id}】提示：如果后续Playwright启动失败，可能需要手动清理残留进程")
-                        # 尝试清理Playwright的内部状态
-                        try:
-                            # 取消可能正在运行的Playwright任务
-                            if hasattr(playwright, '_transport'):
-                                playwright._transport = None
-                        except:
-                            pass
-                    except Exception as e:
-                        logger.warning(f"【{target_cookie_id}】关闭Playwright时出错: {self._safe_str(e)}")
-            except Exception as cleanup_e:
-                logger.warning(f"【{target_cookie_id}】清理浏览器资源时出错: {self._safe_str(cleanup_e)}")
-
-    async def _refresh_cookies_via_browser_page(self, current_cookies_str: str):
-        """使用当前cookie访问指定页面获取真实cookie并更新
-        
-        这是令牌过期时的备用刷新方案，类似于refresh_cookies_from_qr_login，
-        但使用当前的cookie而不是扫码登录的cookie。
-
-        Args:
-            current_cookies_str: 当前的cookie字符串
-
-        Returns:
-            bool: 成功返回True，失败返回False
-        """
-        playwright = None
-        browser = None
-
-        try:
-            import asyncio
-            from playwright.async_api import async_playwright
-            from utils.xianyu_utils import trans_cookies
-
-            logger.info(f"【{self.cookie_id}】开始使用当前cookie访问指定页面获取真实cookie...")
-            logger.info(f"【{self.cookie_id}】当前cookie长度: {len(current_cookies_str)}")
-
-            # 解析当前的cookie
-            current_cookies_dict = trans_cookies(current_cookies_str)
-            logger.info(f"【{self.cookie_id}】当前cookie字段数: {len(current_cookies_dict)}")
-
-            # Docker环境下修复asyncio子进程问题
-            is_docker = os.getenv('DOCKER_ENV') or os.path.exists('/.dockerenv')
-
-            if is_docker:
-                logger.warning(f"【{self.cookie_id}】检测到Docker环境，应用asyncio修复")
-
-                # 创建一个完整的虚拟子进程监视器
-                class DummyChildWatcher:
-                    def __enter__(self):
-                        return self
-                    def __exit__(self, *args):
-                        pass
-                    def is_active(self):
-                        return True
-                    def add_child_handler(self, *args, **kwargs):
-                        pass
-                    def remove_child_handler(self, *args, **kwargs):
-                        pass
-                    def attach_loop(self, *args, **kwargs):
-                        pass
-                    def close(self):
-                        pass
-                    def __del__(self):
-                        pass
-
-                # 创建自定义事件循环策略
-                class DockerEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
-                    def get_child_watcher(self):
-                        return DummyChildWatcher()
-
-                # 临时设置策略
-                old_policy = asyncio.get_event_loop_policy()
-                asyncio.set_event_loop_policy(DockerEventLoopPolicy())
-
-                try:
-                    # 添加超时机制，避免无限等待
-                    playwright = await asyncio.wait_for(
-                        async_playwright().start(),
-                        timeout=30.0  # 30秒超时
-                    )
-                    logger.warning(f"【{self.cookie_id}】Docker环境下Playwright启动成功")
-                except asyncio.TimeoutError:
-                    logger.error(f"【{self.cookie_id}】Docker环境下Playwright启动超时")
-                    return False
-                finally:
-                    # 恢复原策略
-                    asyncio.set_event_loop_policy(old_policy)
-            else:
-                # 非Docker环境，正常启动（也添加超时保护）
-                try:
-                    playwright = await asyncio.wait_for(
-                        async_playwright().start(),
-                        timeout=30.0  # 30秒超时
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(f"【{self.cookie_id}】Playwright启动超时")
-                    return False
-
-            # 启动浏览器（参照商品搜索的配置）
-            browser_args = [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-                '--disable-features=TranslateUI',
-                '--disable-ipc-flooding-protection',
-                '--disable-extensions',
-                '--disable-default-apps',
-                '--disable-sync',
-                '--disable-translate',
-                '--hide-scrollbars',
-                '--mute-audio',
-                '--no-default-browser-check',
-                '--no-pings'
-            ]
-
-            # 在Docker环境中添加额外参数
-            if os.getenv('DOCKER_ENV'):
-                browser_args.extend([
-                    '--disable-background-networking',
-                    '--disable-client-side-phishing-detection',
-                    '--disable-hang-monitor',
-                    '--disable-popup-blocking',
-                    '--disable-prompt-on-repost',
-                    '--disable-web-resources',
-                    '--metrics-recording-only',
-                    '--safebrowsing-disable-auto-update',
-                    '--enable-automation',
-                    '--password-store=basic',
-                    '--use-mock-keychain'
-                ])
-
-            launch_options = self._get_playwright_launch_options(
-                playwright,
-                browser_args,
-                "浏览器页面刷新"
-            )
-            browser = await browser_limit.launch_browser(playwright, launch_options, "浏览器页面刷新")
-
-            # 创建浏览器上下文
-            context_options = {
-                'user_agent': CHROME_UA
-            }
-
-            # 使用标准窗口大小
-            context_options['viewport'] = {'width': 1920, 'height': 1080}
-
-            context = await browser.new_context(**context_options)
-
-            # 设置当前的Cookie
-            cookies = []
-            for cookie_pair in current_cookies_str.split('; '):
-                if '=' in cookie_pair:
-                    name, value = cookie_pair.split('=', 1)
-                    cookies.append({
-                        'name': name.strip(),
-                        'value': value.strip(),
-                        'domain': '.goofish.com',
-                        'path': '/'
-                    })
-
-            await context.add_cookies(cookies)
-            logger.info(f"【{self.cookie_id}】已设置 {len(cookies)} 个当前Cookie到浏览器")
-
-            # 创建页面
-            page = await context.new_page()
-
-            # 等待页面准备
-            await asyncio.sleep(0.1)
-
-            # 访问指定页面获取真实cookie
-            target_url = "https://www.goofish.com/im"
-            logger.info(f"【{self.cookie_id}】访问页面获取真实cookie: {target_url}")
-
-            # 使用更灵活的页面访问策略
-            try:
-                # 首先尝试较短超时
-                await page.goto(target_url, wait_until='domcontentloaded', timeout=15000)
-                logger.info(f"【{self.cookie_id}】页面访问成功")
-            except Exception as e:
-                if 'timeout' in str(e).lower():
-                    logger.warning(f"【{self.cookie_id}】页面访问超时，尝试降级策略...")
-                    try:
-                        # 降级策略：只等待基本加载
-                        await page.goto(target_url, wait_until='load', timeout=20000)
-                        logger.info(f"【{self.cookie_id}】页面访问成功（降级策略）")
-                    except Exception as e2:
-                        logger.warning(f"【{self.cookie_id}】降级策略也失败，尝试最基本访问...")
-                        # 最后尝试：不等待任何加载完成
-                        await page.goto(target_url, timeout=25000)
-                        logger.info(f"【{self.cookie_id}】页面访问成功（最基本策略）")
-                else:
-                    raise e
-
-            # 等待页面完全加载并获取真实cookie
-            logger.info(f"【{self.cookie_id}】页面加载完成，等待获取真实cookie...")
-            await asyncio.sleep(2)
-
-            # 执行一次刷新以确保获取最新的cookie
-            logger.info(f"【{self.cookie_id}】执行页面刷新获取最新cookie...")
-            try:
-                await page.reload(wait_until='domcontentloaded', timeout=12000)
-                logger.info(f"【{self.cookie_id}】页面刷新成功")
-            except Exception as e:
-                if 'timeout' in str(e).lower():
-                    logger.warning(f"【{self.cookie_id}】页面刷新超时，使用降级策略...")
-                    await page.reload(wait_until='load', timeout=15000)
-                    logger.info(f"【{self.cookie_id}】页面刷新成功（降级策略）")
-                else:
-                    raise e
-            await asyncio.sleep(1)
-
-            # 获取更新后的真实Cookie
-            logger.info(f"【{self.cookie_id}】获取真实Cookie...")
-            updated_cookies = await context.cookies()
-
-            # 构造新的Cookie字典
-            real_cookies_dict = {}
-            for cookie in updated_cookies:
-                real_cookies_dict[cookie['name']] = cookie['value']
-
-            # 生成真实cookie字符串
-            real_cookies_str = '; '.join([f"{k}={v}" for k, v in real_cookies_dict.items()])
-
-            logger.info(f"【{self.cookie_id}】真实Cookie已获取，包含 {len(real_cookies_dict)} 个字段")
-            logger.info(
-                f"【{self.cookie_id}】真实Cookie采集完成: "
-                f"fields={len(real_cookies_dict)}, length={len(real_cookies_str)}"
-            )
-            # 检查关键字段
-            important_keys = ['unb', '_m_h5_tk', '_m_h5_tk_enc', 'cookie2', 't', 'sgcookie', 'cna']
-            logger.info(f"【{self.cookie_id}】关键字段检查:")
-            for key in important_keys:
-                if key in real_cookies_dict:
-                    val = real_cookies_dict[key]
-                    logger.info(f"【{self.cookie_id}】  ✅ {key}: {'存在' if val else '为空'} (长度: {len(str(val)) if val else 0})")
-                else:
-                    logger.info(f"【{self.cookie_id}】  ❌ {key}: 缺失")
-
-            # 检查Cookie是否有有效更新
-            changed_cookies = []
-            new_cookies = []
-            for name, new_value in real_cookies_dict.items():
-                old_value = current_cookies_dict.get(name)
-                if old_value is None:
-                    new_cookies.append(name)
-                elif old_value != new_value:
-                    changed_cookies.append(name)
-
-            if not changed_cookies and not new_cookies:
-                logger.warning(f"【{self.cookie_id}】Cookie无变化，可能当前cookie已失效")
-                return False
-
-            logger.info(f"【{self.cookie_id}】发生变化的Cookie字段 ({len(changed_cookies)}个): {', '.join(changed_cookies[:10])}")
-            if new_cookies:
-                logger.info(f"【{self.cookie_id}】新增的Cookie字段 ({len(new_cookies)}个): {', '.join(new_cookies[:10])}")
-
-            # 更新Cookie并重启任务
-            logger.info(f"【{self.cookie_id}】开始更新Cookie并重启任务...")
-            update_success = await self._update_cookies_and_restart(real_cookies_str)
-
-            if update_success:
-                logger.info(f"【{self.cookie_id}】通过访问指定页面成功更新Cookie并重启任务")
-                return True
-            else:
-                logger.error(f"【{self.cookie_id}】更新Cookie或重启任务失败")
-                return False
-
-        except Exception as e:
-            logger.error(f"【{self.cookie_id}】使用当前cookie访问指定页面获取真实cookie失败: {self._safe_str(e)}")
-            return False
-        finally:
-            # 确保资源清理
-            try:
-                # 先关闭浏览器，再关闭Playwright（顺序很重要）
-                if browser:
-                    try:
-                        await asyncio.wait_for(browser.close(), timeout=5.0)
-                        logger.warning(f"【{self.cookie_id}】浏览器关闭完成")
-                    except asyncio.TimeoutError:
-                        logger.warning(f"【{self.cookie_id}】浏览器关闭超时（5秒），资源可能未完全释放")
-                    except Exception as e:
-                        logger.warning(f"【{self.cookie_id}】关闭浏览器时出错: {self._safe_str(e)}")
-                
-                # Playwright关闭：使用更短的超时，超时后立即放弃
-                if playwright:
-                    try:
-                        logger.warning(f"【{self.cookie_id}】正在关闭Playwright...")
-                        await asyncio.wait_for(playwright.stop(), timeout=2.0)
-                        logger.warning(f"【{self.cookie_id}】Playwright关闭完成")
-                    except asyncio.TimeoutError:
-                        logger.warning(f"【{self.cookie_id}】Playwright关闭超时（2秒），进程可能仍在运行")
-                    except Exception as e:
-                        logger.warning(f"【{self.cookie_id}】关闭Playwright时出错: {self._safe_str(e)}")
-            except Exception as cleanup_e:
-                logger.warning(f"【{self.cookie_id}】清理浏览器资源时出错: {self._safe_str(cleanup_e)}")
-
-    def reset_qr_cookie_refresh_flag(self):
-        """重置扫码登录Cookie刷新标志，允许立即执行_refresh_cookies_via_browser"""
-        self.last_qr_cookie_refresh_time = 0
-        logger.info(f"【{self.cookie_id}】已重置扫码登录Cookie刷新标志")
-
-    def get_qr_cookie_refresh_remaining_time(self) -> int:
-        """获取扫码登录Cookie刷新剩余冷却时间（秒）"""
-        current_time = time.time()
-        time_since_qr_refresh = current_time - self.last_qr_cookie_refresh_time
-        remaining_time = max(0, self.qr_cookie_refresh_cooldown - time_since_qr_refresh)
-        return int(remaining_time)
-
-    async def _refresh_cookies_via_browser(self, triggered_by_refresh_token: bool = False):
-        """通过浏览器访问指定页面刷新Cookie
-
-        Args:
-            triggered_by_refresh_token: 是否由refresh_token方法触发，如果是True则设置browser_cookie_refreshed标志
-        """
-
-
-        playwright = None
-        browser = None
-        try:
-            import asyncio
-            from playwright.async_api import async_playwright
-
-            # 检查是否需要等待扫码登录Cookie刷新的冷却时间
-            current_time = time.time()
-            time_since_qr_refresh = current_time - self.last_qr_cookie_refresh_time
-
-            if time_since_qr_refresh < self.qr_cookie_refresh_cooldown:
-                remaining_time = self.qr_cookie_refresh_cooldown - time_since_qr_refresh
-                remaining_minutes = int(remaining_time // 60)
-                remaining_seconds = int(remaining_time % 60)
-
-                logger.info(f"【{self.cookie_id}】扫码登录Cookie刷新冷却中，还需等待 {remaining_minutes}分{remaining_seconds}秒")
-                logger.info(f"【{self.cookie_id}】跳过本次浏览器Cookie刷新")
-                return False
-
-            logger.info(f"【{self.cookie_id}】开始通过浏览器刷新Cookie...")
-            logger.info(f"【{self.cookie_id}】刷新前Cookie长度: {len(self.cookies_str)}")
-            logger.info(f"【{self.cookie_id}】刷新前Cookie字段数: {len(self.cookies)}")
-
-            # Docker环境下修复asyncio子进程问题
-            is_docker = os.getenv('DOCKER_ENV') or os.path.exists('/.dockerenv')
-
-            if is_docker:
-                logger.warning(f"【{self.cookie_id}】检测到Docker环境，应用asyncio修复")
-
-                # 创建一个完整的虚拟子进程监视器
-                class DummyChildWatcher:
-                    def __enter__(self):
-                        return self
-                    def __exit__(self, *args):
-                        pass
-                    def is_active(self):
-                        return True
-                    def add_child_handler(self, *args, **kwargs):
-                        pass
-                    def remove_child_handler(self, *args, **kwargs):
-                        pass
-                    def attach_loop(self, *args, **kwargs):
-                        pass
-                    def close(self):
-                        pass
-                    def __del__(self):
-                        pass
-
-                # 创建自定义事件循环策略
-                class DockerEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
-                    def get_child_watcher(self):
-                        return DummyChildWatcher()
-
-                # 临时设置策略
-                old_policy = asyncio.get_event_loop_policy()
-                asyncio.set_event_loop_policy(DockerEventLoopPolicy())
-
-                try:
-                    # 添加超时机制，避免无限等待
-                    playwright = await asyncio.wait_for(
-                        async_playwright().start(),
-                        timeout=30.0  # 30秒超时
-                    )
-                    logger.warning(f"【{self.cookie_id}】Docker环境下Playwright启动成功")
-                except asyncio.TimeoutError:
-                    logger.error(f"【{self.cookie_id}】Docker环境下Playwright启动超时")
-                    return False
-                finally:
-                    # 恢复原策略
-                    asyncio.set_event_loop_policy(old_policy)
-            else:
-                # 非Docker环境，正常启动（也添加超时保护）
-                try:
-                    playwright = await asyncio.wait_for(
-                        async_playwright().start(),
-                        timeout=30.0  # 30秒超时
-                    )
-                except asyncio.TimeoutError:
-                    logger.error(f"【{self.cookie_id}】Playwright启动超时")
-                    return False
-
-            # 启动浏览器（参照商品搜索的配置）
-            browser_args = [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--disable-gpu',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-                '--disable-features=TranslateUI',
-                '--disable-ipc-flooding-protection',
-                '--disable-extensions',
-                '--disable-default-apps',
-                '--disable-sync',
-                '--disable-translate',
-                '--hide-scrollbars',
-                '--mute-audio',
-                '--no-default-browser-check',
-                '--no-pings'
-            ]
-
-            # 在Docker环境中添加额外参数
-            if os.getenv('DOCKER_ENV'):
-                browser_args.extend([
-                    # '--single-process',  # 注释掉，避免多用户并发时的进程冲突和资源泄漏
-                    '--disable-background-networking',
-                    '--disable-client-side-phishing-detection',
-                    '--disable-hang-monitor',
-                    '--disable-popup-blocking',
-                    '--disable-prompt-on-repost',
-                    '--disable-web-resources',
-                    '--metrics-recording-only',
-                    '--safebrowsing-disable-auto-update',
-                    '--enable-automation',
-                    '--password-store=basic',
-                    '--use-mock-keychain'
-                ])
-
-            launch_options = self._get_playwright_launch_options(
-                playwright,
-                browser_args,
-                "定时Cookie刷新"
-            )
-            browser = await browser_limit.launch_browser(playwright, launch_options, "定时Cookie刷新")
-
-            # 创建浏览器上下文
-            context_options = {
-                'user_agent': CHROME_UA
-            }
-
-            # 使用标准窗口大小
-            context_options['viewport'] = {'width': 1920, 'height': 1080}
-
-            context = await browser.new_context(**context_options)
-
-            # 设置当前Cookie
-            cookies = []
-            for cookie_pair in self.cookies_str.split('; '):
-                if '=' in cookie_pair:
-                    name, value = cookie_pair.split('=', 1)
-                    cookies.append({
-                        'name': name.strip(),
-                        'value': value.strip(),
-                        'domain': '.goofish.com',
-                        'path': '/'
-                    })
-
-            await context.add_cookies(cookies)
-            logger.info(f"【{self.cookie_id}】已设置 {len(cookies)} 个Cookie到浏览器")
-
-            # 创建页面
-            page = await context.new_page()
-
-            # 等待页面准备
-            await asyncio.sleep(0.1)
-
-            # 访问指定页面
-            target_url = "https://www.goofish.com/im"
-            logger.info(f"【{self.cookie_id}】访问页面: {target_url}")
-
-            # 使用更灵活的页面访问策略
-            try:
-                # 首先尝试较短超时
-                await page.goto(target_url, wait_until='domcontentloaded', timeout=15000)
-                logger.info(f"【{self.cookie_id}】页面访问成功")
-            except Exception as e:
-                if 'timeout' in str(e).lower():
-                    logger.warning(f"【{self.cookie_id}】页面访问超时，尝试降级策略...")
-                    try:
-                        # 降级策略：只等待基本加载
-                        await page.goto(target_url, wait_until='load', timeout=20000)
-                        logger.info(f"【{self.cookie_id}】页面访问成功（降级策略）")
-                    except Exception as e2:
-                        logger.warning(f"【{self.cookie_id}】降级策略也失败，尝试最基本访问...")
-                        # 最后尝试：不等待任何加载完成
-                        await page.goto(target_url, timeout=25000)
-                        logger.info(f"【{self.cookie_id}】页面访问成功（最基本策略）")
-                else:
-                    raise e
-
-            # Cookie刷新模式：执行两次刷新
-            logger.info(f"【{self.cookie_id}】页面加载完成，开始刷新...")
-            await asyncio.sleep(1)
-
-            # 第一次刷新 - 带重试机制
-            logger.info(f"【{self.cookie_id}】执行第一次刷新...")
-            try:
-                await page.reload(wait_until='domcontentloaded', timeout=12000)
-                logger.info(f"【{self.cookie_id}】第一次刷新成功")
-            except Exception as e:
-                if 'timeout' in str(e).lower():
-                    logger.warning(f"【{self.cookie_id}】第一次刷新超时，使用降级策略...")
-                    await page.reload(wait_until='load', timeout=15000)
-                    logger.info(f"【{self.cookie_id}】第一次刷新成功（降级策略）")
-                else:
-                    raise e
-            await asyncio.sleep(1)
-
-            # 第二次刷新 - 带重试机制
-            logger.info(f"【{self.cookie_id}】执行第二次刷新...")
-            try:
-                await page.reload(wait_until='domcontentloaded', timeout=12000)
-                logger.info(f"【{self.cookie_id}】第二次刷新成功")
-            except Exception as e:
-                if 'timeout' in str(e).lower():
-                    logger.warning(f"【{self.cookie_id}】第二次刷新超时，使用降级策略...")
-                    await page.reload(wait_until='load', timeout=15000)
-                    logger.info(f"【{self.cookie_id}】第二次刷新成功（降级策略）")
-                else:
-                    raise e
-            await asyncio.sleep(1)
-
-            # Cookie刷新模式：正常更新Cookie
-            logger.info(f"【{self.cookie_id}】获取更新后的Cookie...")
-            updated_cookies = await context.cookies()
-            
-            # 获取并打印当前页面标题
-            page_title = await page.title()
-            logger.info(f"【{self.cookie_id}】当前页面标题: {page_title}")
-
-            # 构造新的Cookie字典
-            new_cookies_dict = {}
-            for cookie in updated_cookies:
-                new_cookies_dict[cookie['name']] = cookie['value']
-
-            # 检查Cookie变化
-            changed_cookies = []
-            new_cookies = []
-            for name, new_value in new_cookies_dict.items():
-                old_value = self.cookies.get(name)
-                if old_value is None:
-                    new_cookies.append(name)
-                elif old_value != new_value:
-                    changed_cookies.append(name)
-
-            # 更新self.cookies和cookies_str
-            self.cookies.update(new_cookies_dict)
-            self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-
-            logger.info(f"【{self.cookie_id}】Cookie已更新，包含 {len(new_cookies_dict)} 个字段")
-
-            # 显示Cookie变化统计
-            if changed_cookies:
-                logger.info(f"【{self.cookie_id}】发生变化的Cookie字段 ({len(changed_cookies)}个): {', '.join(changed_cookies)}")
-            if new_cookies:
-                logger.info(f"【{self.cookie_id}】新增的Cookie字段 ({len(new_cookies)}个): {', '.join(new_cookies)}")
-            if not changed_cookies and not new_cookies:
-                logger.info(f"【{self.cookie_id}】Cookie无变化")
-
-            logger.info(
-                f"【{self.cookie_id}】更新后Cookie字段名: "
-                f"{', '.join(sorted(new_cookies_dict.keys()))}"
-            )
-
-            # 只记录关键字段是否存在，不记录任何Cookie值或片段。
-            important_cookies = ['_m_h5_tk', '_m_h5_tk_enc', 'cookie2', 't', 'sgcookie', 'unb', 'uc1', 'uc3', 'uc4']
-            present_important_cookies = [
-                cookie_name
-                for cookie_name in important_cookies
-                if cookie_name in new_cookies_dict
-            ]
-            logger.info(
-                f"【{self.cookie_id}】关键Cookie字段检查: "
-                f"{', '.join(present_important_cookies) or '无'}"
-            )
-
-            # 更新数据库中的Cookie
-            await self.update_config_cookies()
-
-            # 只有当由refresh_token触发时才设置浏览器Cookie刷新成功标志
-            if triggered_by_refresh_token:
-                self.browser_cookie_refreshed = True
-                logger.info(f"【{self.cookie_id}】由refresh_token触发，浏览器Cookie刷新成功标志已设置为True")
-
-                # 兜底：直接在此处触发实例重启，避免外层协程在返回后被取消导致未重启
-                try:
-                    # 标记"刷新流程内已触发重启"，供外层去重
-                    self.restarted_in_browser_refresh = True
-
-                    logger.info(f"【{self.cookie_id}】Cookie刷新成功，准备重启实例...(via _refresh_cookies_via_browser)")
-                    await self._restart_instance()
-                    
-                    # ⚠️ _restart_instance() 已触发重启，当前任务即将被取消
-                    # 不要等待或执行耗时操作
-                    logger.info(f"【{self.cookie_id}】重启请求已触发(via _refresh_cookies_via_browser)")
-                    
-                    # 标记重启标志（无需主动关闭WS，重启由管理器处理）
-                    self.connection_restart_flag = True
-                except Exception as e:
-                    logger.error(f"【{self.cookie_id}】兜底重启失败: {self._safe_str(e)}")
-            else:
-                logger.info(f"【{self.cookie_id}】由定时任务触发，不设置浏览器Cookie刷新成功标志")
-
-            logger.info(f"【{self.cookie_id}】Cookie刷新完成")
-            return True
-
-        except Exception as e:
-            logger.error(f"【{self.cookie_id}】通过浏览器刷新Cookie失败: {self._safe_str(e)}")
-            return False
-        finally:
-            # 异步关闭浏览器：创建清理任务并等待完成，确保资源正确释放
-            close_task = None
-            try:
-                if browser or playwright:
-                    # 创建关闭任务
-                    close_task = asyncio.create_task(
-                        self._async_close_browser(browser, playwright)
-                    )
-                    logger.info(f"【{self.cookie_id}】浏览器异步关闭任务已启动")
-                    
-                    # 等待关闭任务完成，但设置超时避免阻塞太久
-                    try:
-                        await asyncio.wait_for(close_task, timeout=15.0)
-                        logger.info(f"【{self.cookie_id}】浏览器关闭任务已完成")
-                    except asyncio.TimeoutError:
-                        logger.warning(f"【{self.cookie_id}】浏览器关闭任务超时（15秒），强制继续")
-                        # 取消任务，避免资源泄漏
-                        if not close_task.done():
-                            close_task.cancel()
-                            try:
-                                await close_task
-                            except (asyncio.CancelledError, Exception):
-                                pass
-                    except Exception as wait_e:
-                        logger.warning(f"【{self.cookie_id}】等待浏览器关闭任务时出错: {self._safe_str(wait_e)}")
-                        # 确保任务被取消
-                        if close_task and not close_task.done():
-                            close_task.cancel()
-                            try:
-                                await close_task
-                            except (asyncio.CancelledError, Exception):
-                                pass
-            except Exception as cleanup_e:
-                logger.warning(f"【{self.cookie_id}】创建浏览器关闭任务时出错: {self._safe_str(cleanup_e)}")
-                # 如果创建任务失败，尝试直接关闭
-                if browser or playwright:
-                    try:
-                        await self._force_close_resources(browser, playwright)
-                    except Exception:
-                        pass
 
     async def _async_close_browser(self, browser, playwright):
         """异步关闭：正常关闭，超时后强制关闭"""
         try:
             logger.info(f"【{self.cookie_id}】开始异步关闭浏览器...")  # 改为info级别
-            
+
             # 正常关闭，设置超时
             await asyncio.wait_for(
                 self._normal_close_resources(browser, playwright),
                 timeout=10.0
             )
             logger.info(f"【{self.cookie_id}】浏览器正常关闭完成")  # 改为info级别
-            
+
         except asyncio.TimeoutError:
             logger.warning(f"【{self.cookie_id}】正常关闭超时，开始强制关闭...")
             await self._force_close_resources(browser, playwright)
-            
+
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】异步关闭时出错，强制关闭: {self._safe_str(e)}")
             await self._force_close_resources(browser, playwright)
@@ -8078,7 +6727,7 @@ class XianyuLive:
                         pass
                 except Exception as e:
                     logger.warning(f"【{self.cookie_id}】关闭浏览器时出错: {e}")
-            
+
             # 关闭Playwright：使用短超时，如果超时就放弃
             if playwright:
                 try:
@@ -8096,28 +6745,28 @@ class XianyuLive:
                         pass
                 except Exception as e:
                     logger.warning(f"【{self.cookie_id}】关闭Playwright时出错: {e}")
-                
+
         except Exception as e:
             logger.error(f"【{self.cookie_id}】正常关闭时出现异常: {e}")
             raise
 
-    
+
     async def _force_close_resources(self, browser, playwright):
         """强制关闭资源：强制关闭浏览器+Playwright超时等待"""
         try:
             logger.warning(f"【{self.cookie_id}】开始强制关闭资源...")
-            
+
             # 强制关闭浏览器+Playwright，设置短超时
             force_tasks = []
             if browser:
                 force_tasks.append(asyncio.wait_for(browser.close(), timeout=3.0))
             if playwright:
                 force_tasks.append(asyncio.wait_for(playwright.stop(), timeout=3.0))
-            
+
             if force_tasks:
                 # 使用gather执行，所有失败都会被忽略
                 results = await asyncio.gather(*force_tasks, return_exceptions=True)
-                
+
                 # 检查是否有超时或异常，尝试强制清理
                 for i, result in enumerate(results):
                     if isinstance(result, (asyncio.TimeoutError, Exception)):
@@ -8130,11 +6779,11 @@ class XianyuLive:
                                 playwright._connection.dispose()
                         except Exception:
                             pass
-                
+
                 logger.info(f"【{self.cookie_id}】强制关闭完成")
             else:
                 logger.info(f"【{self.cookie_id}】没有需要强制关闭的资源")
-            
+
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】强制关闭时出现异常（已忽略）: {e}")
 
@@ -8733,7 +7382,7 @@ class XianyuLive:
                                             logger.info(f"【{self.cookie_id}】准备上传默认回复本地图片到闲鱼CDN: {local_image_path}")
                                             
                                             from utils.image_uploader import ImageUploader
-                                            uploader = ImageUploader(self.cookies_str)
+                                            uploader = ImageUploader(self.cookie_id, self.cookies_str)
                                             
                                             async with uploader:
                                                 cdn_url = await uploader.upload_image(local_image_path)
@@ -8932,7 +7581,7 @@ class XianyuLive:
                     ack["headers"]["ua"] = message["headers"]["ua"]
                 if 'dt' in message["headers"]:
                     ack["headers"]["dt"] = message["headers"]["dt"]
-                await websocket.send(json.dumps(ack))
+                await self._send_account_frame(websocket, json.dumps(ack))
             except Exception as e:
                 pass
 
@@ -9468,7 +8117,7 @@ class XianyuLive:
                             self.last_successful_connection = time.time()
 
                             # 记录后台任务启动前的状态
-                            logger.warning(f"【{self.cookie_id}】准备启动后台任务 - 当前状态: heartbeat={self.heartbeat_task}, token_refresh={self.token_refresh_task}, cleanup={self.cleanup_task}, cookie_refresh={self.cookie_refresh_task}")
+                            logger.warning(f"【{self.cookie_id}】准备启动后台任务 - 当前状态: heartbeat={self.heartbeat_task}, token_refresh={self.token_refresh_task}, cleanup={self.cleanup_task}")
                             
                             # 如果存在心跳任务引用，先清理（心跳任务依赖WebSocket，必须重启）
                             if self.heartbeat_task:
@@ -9550,7 +8199,7 @@ class XianyuLive:
                                 logger.info(f"【{self.cookie_id}】✅ 新启动的任务: {', '.join(tasks_started)}")
                             item_sync_status = '运行中' if self.item_sync_task and not self.item_sync_task.done() else '已启动' if self.item_sync_enabled else '未启用'
                             order_sync_status = '运行中' if self.order_sync_task and not self.order_sync_task.done() else '已启动'
-                            logger.info(f"【{self.cookie_id}】✅ 所有后台任务状态: 心跳(已启动), Token刷新({'运行中' if self.token_refresh_task and not self.token_refresh_task.done() else '已启动'}), 暂停清理({'运行中' if self.cleanup_task and not self.cleanup_task.done() else '已启动'}), Cookie刷新({'运行中' if self.cookie_refresh_task and not self.cookie_refresh_task.done() else '已启动'}), 商品同步({item_sync_status}), 订单同步({order_sync_status})")
+                            logger.info(f"【{self.cookie_id}】✅ 所有后台任务状态: 心跳(已启动), Token刷新({'运行中' if self.token_refresh_task and not self.token_refresh_task.done() else '已启动'}), 暂停清理({'运行中' if self.cleanup_task and not self.cleanup_task.done() else '已启动'}), 商品同步({item_sync_status}), 订单同步({order_sync_status})")
                             
                             logger.info(f"【{self.cookie_id}】开始监听WebSocket消息...")
                             logger.info(f"【{self.cookie_id}】WebSocket连接状态正常，等待服务器消息...")
@@ -9719,7 +8368,6 @@ class XianyuLive:
                         self.heartbeat_task = None
                         self.token_refresh_task = None
                         self.cleanup_task = None
-                        self.cookie_refresh_task = None
                         logger.warning(f"【{self.cookie_id}】清理失败，已强制重置所有任务引用")
                         # 使用可中断的sleep，并定期输出日志
                         logger.info(f"【{self.cookie_id}】清理失败后开始等待 {retry_delay} 秒...")
@@ -9762,7 +8410,6 @@ class XianyuLive:
                 self.heartbeat_task and not self.heartbeat_task.done(),
                 self.token_refresh_task and not self.token_refresh_task.done(),
                 self.cleanup_task and not self.cleanup_task.done(),
-                self.cookie_refresh_task and not self.cookie_refresh_task.done()
             ])
             
             if has_pending_tasks:
@@ -9782,14 +8429,12 @@ class XianyuLive:
                     self.heartbeat_task = None
                     self.token_refresh_task = None
                     self.cleanup_task = None
-                    self.cookie_refresh_task = None
             else:
                 logger.info(f"【{self.cookie_id}】所有后台任务已清理完成，跳过重复清理")
                 # 确保任务引用被重置
                 self.heartbeat_task = None
                 self.token_refresh_task = None
                 self.cleanup_task = None
-                self.cookie_refresh_task = None
             
             # 清理所有后台任务
             if self.background_tasks:
@@ -10033,8 +8678,8 @@ class XianyuLive:
 
             data_val = json.dumps(data, separators=(',', ':'))
             params['sign'] = generate_sign(params['t'], token, data_val)
-            async with self.session.post(
-                'https://h5api.m.goofish.com/h5/mtop.idle.web.xyh.item.list/1.0/',
+            async with platform_request(self.session, self.cookie_id, 'post', cookies=self.cookies_str,
+                url='https://h5api.m.goofish.com/h5/mtop.idle.web.xyh.item.list/1.0/',
                 params=params,
                 data={'data': data_val}
             ) as response:
@@ -10056,21 +8701,6 @@ class XianyuLive:
                     raise ItemListTransientError(
                         f"闲鱼接口响应结构异常（HTTP {response.status}）"
                     )
-                if 'set-cookie' in response.headers:
-                    new_cookies = {}
-                    for cookie in response.headers.getall('set-cookie', []):
-                        if '=' in cookie:
-                            name, value = cookie.split(';')[0].split('=', 1)
-                            new_cookies[name.strip()] = value.strip()
-                    if new_cookies:
-                        self.cookies.update(new_cookies)
-                        self.cookies_str = '; '.join(f"{key}={value}" for key, value in self.cookies.items())
-                        self.session.headers['cookie'] = self.cookies_str
-                        await self.update_config_cookies()
-                        logger.info(
-                            f"【{self.cookie_id}】商品同步响应更新了"
-                            f"{len(new_cookies)}个Cookie字段"
-                        )
                 return res_json
 
         try:
@@ -10270,6 +8900,8 @@ class XianyuLive:
             )
             await asyncio.sleep(backoff)
             return await self.get_item_list_info(page_number, page_size, retry_count + 1)
+        except RiskControlBlocked as exc:
+            return {'error': str(exc), 'waiting_browser': True}
         except Exception as e:
             logger.error(f"商品信息API请求异常: {self._safe_str(e)}")
             await asyncio.sleep(0.5)
@@ -10384,7 +9016,7 @@ class XianyuLive:
 
                     # 使用图片上传器上传到闲鱼CDN
                     from utils.image_uploader import ImageUploader
-                    uploader = ImageUploader(self.cookies_str)
+                    uploader = ImageUploader(self.cookie_id, self.cookies_str)
 
                     async with uploader:
                         cdn_url = await uploader.upload_image(local_image_path)
@@ -10483,7 +9115,7 @@ class XianyuLive:
                 ]
             }
 
-            await ws.send(json.dumps(msg))
+            await self._send_account_frame(ws, json.dumps(msg))
             logger.info(f"【{self.cookie_id}】图片消息发送成功: {image_url}")
 
         except Exception as e:
@@ -10497,7 +9129,7 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】开始上传图片: {image_path}")
 
             from utils.image_uploader import ImageUploader
-            uploader = ImageUploader(self.cookies_str)
+            uploader = ImageUploader(self.cookie_id, self.cookies_str)
 
             async with uploader:
                 image_url = await uploader.upload_image(image_path)

@@ -1,6 +1,7 @@
 """
 图片上传器 - 负责将图片上传到闲鱼CDN
 """
+from utils.account_browser.credentials import platform_request
 import aiohttp
 import json
 import os
@@ -14,7 +15,8 @@ from utils.user_agents import CHROME_UA
 class ImageUploader:
     """图片上传器 - 上传图片到闲鱼CDN"""
     
-    def __init__(self, cookies_str: str):
+    def __init__(self, cookie_id: str, cookies_str: str):
+        self.cookie_id = cookie_id
         self.cookies_str = cookies_str
         self.upload_url = "https://stream-upload.goofish.com/api/upload.api?floderId=0&appkey=xy_chat&_input_charset=utf-8"
         self.session = None
@@ -135,7 +137,7 @@ class ImageUploader:
             
             # 发送上传请求
             logger.info(f"开始上传图片到闲鱼CDN: {filename}")
-            async with self.session.post(self.upload_url, data=data, headers=headers) as response:
+            async with platform_request(self.session, self.cookie_id, 'post', self.upload_url, cookies=self.cookies_str, data=data, headers=headers) as response:
                 if response.status == 200:
                     response_text = await response.text()
                     logger.debug(f"上传响应: {response_text}")

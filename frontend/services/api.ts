@@ -314,17 +314,19 @@ export const getRiskControlStatus = async (): Promise<{
   return get('/api/risk-control/status');
 };
 
+export type BrowserCredentialStatus = { credentials_state: 'waiting' | 'captured' | 'active' | 'error'; captured: boolean; captured_at?: number; message: string };
+export type BrowserStatus = BrowserListenerStatus & BrowserCredentialStatus & { account_id?: string };
 export type BrowserListenerStatus = { listening: boolean; listener_state: 'connecting' | 'listening' | 'disconnected'; listener_error?: string };
 export const reconnectBrowserListener = (): Promise<BrowserDesktop & BrowserListenerStatus> => post('/api/account-browser/reconnect', {}, { timeout: 120000 });
 export type BrowserDesktop = { message: string; desktop_url?: string; open_url?: string };
 
-export const accountBrowserAction = (accountId: string, action: 'open' | 'restart' | 'confirm' | 'release'): Promise<BrowserDesktop> =>
+export const accountBrowserAction = (accountId: string, action: 'open' | 'restart'): Promise<BrowserDesktop> =>
   post(`/api/account-browser/${encodeURIComponent(accountId)}/${action}`, {}, { timeout: 120000 });
 export const setupBrowserAccount = (): Promise<BrowserDesktop> => post('/api/account-browser/setup', {}, { timeout: 120000 });
-export const browserSetupStatus = (): Promise<BrowserListenerStatus & { account_id?: string; message: string }> => get('/api/account-browser/setup-status');
+export const browserSetupStatus = (): Promise<BrowserStatus> => get('/api/account-browser/setup-status');
 export const browserDesktopLink = (): Promise<{ open_url: string }> => post('/api/account-browser/desktop-link', {});
 export const clearBrowserData = (): Promise<BrowserDesktop> => post('/api/account-browser/clear', { confirmed: true }, { timeout: 120000 });
-export const accountBrowserStatus = (accountId: string): Promise<BrowserListenerStatus & { manual: boolean; captured: boolean; message: string }> =>
+export const accountBrowserStatus = (accountId: string): Promise<BrowserStatus> =>
   get(`/api/account-browser/${encodeURIComponent(accountId)}/status`);
 
 // 商品擦亮：重新获取搜索曝光，平台对每日次数有限制

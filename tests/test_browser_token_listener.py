@@ -22,6 +22,8 @@ class StoreTests(unittest.TestCase):
         self.assertIs(store.get('a'), first)
         second = BrowserToken('123', 'two', 'did', 'app', 'unb=123')
         store.observe('a', second)
+        self.assertIs(store.get('a'), first)
+        store.approve('a', second)
         self.assertIs(store.get('a'), second)
         store.reject('a', 'two')
         store.observe('a', second)
@@ -33,15 +35,24 @@ class StoreTests(unittest.TestCase):
         store.clear('a')
         self.assertIsNone(store.get('a', candidate=True))
 
-    def test_pause_and_release_keep_old_authorized_token(self):
+    def test_pause_requires_explicit_adoption_of_new_capture(self):
         store = TokenStore()
         first = BrowserToken('123', 'one', 'did', 'app', 'unb=123')
         store.observe('a', first)
         store.approve('a', first)
         store.pause('a')
         store.observe('a', BrowserToken('123', 'two', 'did', 'app', 'unb=123'))
-        store.resume('a')
-        self.assertIs(store.get('a'), first)
+        self.assertIsNone(store.get('a'))
+        store.approve('a', store.get('a', candidate=True))
+        self.assertEqual(store.get('a').token, 'two')
+
+    def test_reconnect_cannot_extend_expired_token_lifetime(self):
+        store = TokenStore()
+        old = BrowserToken('123','same','device','app','unb=123',time.time()-3601)
+        store.observe('a', old)
+        store.clear('a')
+        store.observe('a', BrowserToken('123','same','device','app','unb=123'))
+        self.assertIsNone(store.get('a',candidate=True))
 
     def test_secret_values_are_not_in_repr(self):
         value = BrowserToken('123', 'SECRET-TOKEN', 'did', 'app', 'SECRET-COOKIE')

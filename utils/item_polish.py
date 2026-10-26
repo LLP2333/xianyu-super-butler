@@ -12,6 +12,8 @@ import json
 import time
 from typing import Any, Dict, List, Optional
 
+from utils.account_browser.credentials import platform_request
+from utils.risk_control import RiskControlBlocked
 import aiohttp
 from loguru import logger
 
@@ -29,6 +31,7 @@ USER_AGENT = CHROME_UA
 
 async def polish_item(
     session: aiohttp.ClientSession,
+    cookie_id: str,
     cookies_str: str,
     item_id: str,
     timeout: int = 20,
@@ -37,7 +40,7 @@ async def polish_item(
 
     Returns:
         ``{"success": bool, "message": str, "cookies_str": str}``。
-        ``cookies_str`` 是合并响应后的最新 Cookie，调用方应回写。
+        ``cookies_str`` 保持网页捕获的 Cookie，不从业务响应更新登录凭据。
     """
     if not item_id or not cookies_str:
         return {"success": False, "message": "缺少商品ID或Cookie", "cookies_str": cookies_str}
@@ -75,15 +78,15 @@ async def polish_item(
     }
 
     try:
-        async with session.post(
-            POLISH_URL,
+        async with platform_request(session, cookie_id, 'post', POLISH_URL, cookies=cookies_str,
             params=params,
             data={"data": data_val},
             headers=headers,
             timeout=aiohttp.ClientTimeout(total=timeout),
         ) as response:
             result = await response.json(content_type=None)
-            cookies_str = _merge_cookies(response, cookies_str)
+    except RiskControlBlocked:
+        raise
     except Exception as e:
         return {"success": False, "message": f"请求异常: {e}", "cookies_str": cookies_str}
 
@@ -93,28 +96,6 @@ async def polish_item(
     return {"success": success, "message": message, "cookies_str": cookies_str}
 
 
-def _merge_cookies(response, cookies_str: str) -> str:
-    """合并响应下发的新令牌，保持后续请求签名有效。"""
-    if "set-cookie" not in response.headers:
-        return cookies_str
-
-    updates = {}
-    for raw in response.headers.getall("set-cookie", []):
-        pair = raw.split(";", 1)[0].strip()
-        if "=" not in pair:
-            continue
-        key, value = pair.split("=", 1)
-        if key in ("_m_h5_tk", "_m_h5_tk_enc"):
-            updates[key] = value
-
-    if not updates:
-        return cookies_str
-    try:
-        current = trans_cookies(cookies_str) if cookies_str else {}
-    except ValueError:
-        current = {}
-    current.update(updates)
-    return "; ".join(f"{k}={v}" for k, v in current.items())
 
 
 async def polish_account_items(
@@ -151,7 +132,7 @@ async def polish_account_items(
 
     async with aiohttp.ClientSession() as session:
         for index, item_id in enumerate(item_ids):
-            result = await polish_item(session, cookies_str, item_id)
+            result = await polish_item(session, cookie_id, cookies_str, item_id)
             cookies_str = result["cookies_str"]
 
             if result["success"]:

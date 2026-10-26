@@ -7,6 +7,6 @@ class AddressTests(unittest.TestCase):
         self.assertEqual(validate_desktop_address(' https://browser.example.com:8443 '), 'https://browser.example.com:8443/')
 
     def test_invalid_origins(self):
-        for value in ['http://example.com', 'https://user:pass@example.com', 'https://example.com/path', 'https://example.com/?x=1', 'https://example.com/#x', 'https://', 'https://example.com:bad']:
+        for value in ['http://example.com', 'https://user:pass@example.com', 'https://example.com/path', 'https://example.com/?x=1', 'https://example.com/#x', 'https://', 'https://example.com:bad', 'https://example.com?', 'https://example.com#']:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 validate_desktop_address(value)

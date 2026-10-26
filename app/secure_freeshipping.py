@@ -1,3 +1,5 @@
+from utils.account_browser.credentials import platform_request
+from utils.risk_control import RiskControlBlocked
 import asyncio
 import time
 from loguru import logger
@@ -23,17 +25,6 @@ class SecureFreeshipping:
         except:
             return "无法转换的对象"
 
-    async def update_config_cookies(self):
-        """更新数据库中的cookies"""
-        try:
-            from app.db_manager import db_manager
-            
-            # 更新数据库中的Cookie
-            db_manager.update_config_cookies(self.cookie_id, self.cookies_str)
-            logger.debug(f"【{self.cookie_id}】Cookie已更新到数据库")
-            
-        except Exception as e:
-            logger.error(f"【{self.cookie_id}】更新Cookie到数据库失败: {self._safe_str(e)}")
 
     async def auto_freeshipping(self, order_id, item_id, buyer_id, retry_count=0):
         """自动免拼发货 - 加密版本"""
@@ -81,29 +72,14 @@ class SecureFreeshipping:
 
         try:
             logger.info(f"【{self.cookie_id}】开始自动免拼发货，订单ID: {order_id}")
-            async with self.session.post(
-                'https://h5api.m.goofish.com/h5/mtop.idle.groupon.activity.seller.freeshipping/1.0/',
+            async with platform_request(self.session, self.cookie_id, 'post', cookies=self.cookies_str,
+                url='https://h5api.m.goofish.com/h5/mtop.idle.groupon.activity.seller.freeshipping/1.0/',
                 params=params,
                 data=data
             ) as response:
                 res_json = await response.json()
 
                 # 检查并更新Cookie
-                if 'set-cookie' in response.headers:
-                    new_cookies = {}
-                    for cookie in response.headers.getall('set-cookie', []):
-                        if '=' in cookie:
-                            name, value = cookie.split(';')[0].split('=', 1)
-                            new_cookies[name.strip()] = value.strip()
-                    
-                    # 更新cookies
-                    if new_cookies:
-                        self.cookies.update(new_cookies)
-                        # 生成新的cookie字符串
-                        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                        # 更新数据库中的Cookie
-                        await self.update_config_cookies()
-                        logger.debug("已更新Cookie到数据库")
 
                 logger.info(f"【{self.cookie_id}】自动免拼发货响应: {res_json}")
                 
@@ -118,6 +94,8 @@ class SecureFreeshipping:
                     return await self.auto_freeshipping(order_id, item_id, buyer_id, retry_count + 1)
                     
 
+        except RiskControlBlocked as exc:
+            return {"error": str(exc), "waiting_browser": True}
         except Exception as e:
             logger.error(f"【{self.cookie_id}】自动免拼发货API请求异常: {self._safe_str(e)}")
             await asyncio.sleep(0.5)
