@@ -106,7 +106,6 @@ TOKEN_NOTIFICATION_EVENT_MAP = {
     "face_verification": "captcha_manual",
     "captcha_success_db_update_failed": "cookie_invalid",
     "captcha_success_auto_update": "login_success",
-    "password_login_success": "login_success",
     "instance_restart_failed": "instance_restart_failed",
 }
 

@@ -58,31 +58,6 @@ class SliderSlotReleaseTests(unittest.TestCase):
         release.assert_not_called()
 
 
-class PasswordLoginSlotReleaseTests(unittest.TestCase):
-    """浏览器启动失败时，密码登录同样不能漏槽位。"""
-
-    def test_slot_is_released_when_browser_fails_to_start(self):
-        instance = XianyuSliderStealth.__new__(XianyuSliderStealth)
-        instance.user_id = "acc"
-        instance.pure_user_id = "acc"
-
-        # 占槽在浏览器启动之前，而正常释放它的 finally 属于更靠后的内层 try：
-        # 启动本身失败时会跳过那个 finally
-        with (
-            patch.object(browser_limit, "acquire_slot") as acquire,
-            patch.object(browser_limit, "release_slot") as release,
-            patch(
-                "utils.xianyu_slider_stealth.sync_playwright",
-                side_effect=RuntimeError("Executable doesn't exist"),
-            ),
-        ):
-            result = instance.login_with_password_playwright("user", "pass")
-
-        self.assertIsNone(result)
-        self.assertEqual(acquire.call_count, release.call_count, "占用与归还次数不一致")
-        release.assert_called_once()
-
-
 class QrSessionReleaseTests(unittest.IsolatedAsyncioTestCase):
     """监控结束后会话要自清，不能等前端来触发。"""
 

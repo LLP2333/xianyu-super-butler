@@ -39,10 +39,6 @@ export interface AccountDetail {
   remark?: string;
   note?: string; // alias for remark
   pause_duration?: number;
-  // 登录信息
-  username?: string;
-  login_password?: string;
-  show_browser?: boolean;
   // Frontend helpers
   nickname?: string;
   avatar_url?: string;

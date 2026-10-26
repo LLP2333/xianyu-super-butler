@@ -79,10 +79,6 @@ export const changePassword = async (currentPassword: string, newPassword: strin
 
 // Accounts
 export const getAccountDetails = async (): Promise<AccountDetail[]> => {
-  // 只发一次请求。原实现拿到账号列表后，再逐个请求 /cookie/{id}/details 补
-  // username/password/show_browser —— 而列表接口内部本来就查了同一份详情，
-  // 等于对同一份数据做 N+1。页面上有 7 处组件各自调用本函数，账号一多首屏
-  // 就被这些重复请求拖慢；现在列表接口直接返回这几个字段。
   const data = await get<any[]>('/cookies/details');
   return data.map(item => ({
     id: item.id,
@@ -93,10 +89,7 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     remark: item.remark,
     note: item.remark,
     pause_duration: item.pause_duration,
-    username: item.username,
-    login_password: item.login_password,
-    show_browser: item.show_browser,
-    nickname: item.nickname || item.remark || item.username || `账号 ${item.id.substring(0, 6)}`,
+    nickname: item.nickname || item.remark || `账号 ${item.id.substring(0, 6)}`,
     avatar_url: item.avatar_url,
     location: item.location,
     bio: item.bio,
@@ -134,14 +127,6 @@ export const updateAccountPauseDuration = async (id: string, pauseDuration: numb
 
 export const updateAccountCookie = async (id: string, value: string): Promise<any> => {
   return put(`/cookies/${id}`, { id, value });
-};
-
-export const updateAccountLoginInfo = async (id: string, data: {
-  username?: string;
-  login_password?: string;
-  show_browser?: boolean;
-}): Promise<any> => {
-  return put(`/cookies/${id}/login-info`, data);
 };
 
 export const getAllAISettings = async (): Promise<Record<string, AIReplySettings>> => {

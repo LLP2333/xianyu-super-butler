@@ -10,7 +10,6 @@ import {
   updateAccountAutoConfirm,
   updateAccountPauseDuration,
   updateAccountCookie,
-  updateAccountLoginInfo,
   updateAccountAISettings,
   getAllAISettings,
   getAccountAISettings,
@@ -18,7 +17,7 @@ import {
   getRiskControlStatus,
 } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
-import {Power, Edit2, Trash2, X, Check, Loader2, MessageSquare, RefreshCw, Save, User, Clock, Key, Eye, EyeOff, Bot, Settings, MapPin, Users, ShieldCheck} from 'lucide-react';
+import {Power, Edit2, Trash2, X, Check, Loader2, MessageSquare, RefreshCw, Save, User, Clock, Bot, Settings, MapPin, Users, ShieldCheck} from 'lucide-react';
 import { EmptyState, PageHeader, PageLoading } from './ui';
 
 type ModalType = 'edit' | 'ai-settings' | null;
@@ -50,10 +49,6 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
     cookie: '',
     auto_confirm: false,
     pause_duration: 0,
-    username: '',
-    login_password: '',
-    show_browser: false,
-    showLoginPassword: false,
   });
 
   // AI设置表单状态（字段必须齐全：PUT 是整行 INSERT OR REPLACE，
@@ -167,10 +162,6 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
       cookie: account.cookie || account.value || '',
       auto_confirm: account.auto_confirm || false,
       pause_duration: account.pause_duration || 0,
-      username: account.username || '',
-      login_password: account.login_password || '',
-      show_browser: account.show_browser || false,
-      showLoginPassword: false,
     });
     setActiveModal('edit');
   };
@@ -229,19 +220,6 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
       // 更新暂停时长
       if (editForm.pause_duration !== (editingAccount.pause_duration || 0)) {
         promises.push(updateAccountPauseDuration(editingAccount.id, editForm.pause_duration));
-      }
-
-      // 更新登录信息
-      if (
-        editForm.username !== (editingAccount.username || '') ||
-        editForm.login_password !== (editingAccount.login_password || '') ||
-        editForm.show_browser !== (editingAccount.show_browser || false)
-      ) {
-        promises.push(updateAccountLoginInfo(editingAccount.id, {
-          username: editForm.username,
-          login_password: editForm.login_password,
-          show_browser: editForm.show_browser,
-        }));
       }
 
       await Promise.all(promises);
@@ -606,63 +584,6 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
                 <p className="text-xs text-gray-500 mt-1">设置后会暂停处理该账号的订单，到时间后自动恢复</p>
               </div>
 
-              {/* 登录信息 */}
-              <div className="border-t border-gray-200 pt-5">
-                <h3 className="text-lg font-bold text-gray-900 mb-4 flex items-center gap-2">
-                  <Key className="w-5 h-5 text-amber-500" />
-                  登录信息
-                </h3>
-                <div className="space-y-4">
-                  <div>
-                    <label className="block text-sm font-bold text-gray-700 mb-2">用户名</label>
-                    <input
-                      type="text"
-                      value={editForm.username}
-                      onChange={(e) => setEditForm({ ...editForm, username: e.target.value })}
-                      placeholder="闲鱼账号/手机号"
-                      className="ios-input w-full rounded-md px-3 py-2.5"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-bold text-gray-700 mb-2">登录密码</label>
-                    <div className="relative">
-                      <input
-                        type={editForm.showLoginPassword ? 'text' : 'password'}
-                        value={editForm.login_password}
-                        onChange={(e) => setEditForm({ ...editForm, login_password: e.target.value })}
-                        placeholder="用于自动登录"
-                        className="ios-input w-full rounded-md px-3 py-2.5 pr-11"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setEditForm({ ...editForm, showLoginPassword: !editForm.showLoginPassword })}
-                        className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
-                      >
-                        {editForm.showLoginPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
-                      </button>
-                    </div>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <div className="font-bold text-gray-900">登录时显示浏览器</div>
-                      <div className="text-xs text-gray-500">调试时可开启查看登录过程</div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setEditForm({ ...editForm, show_browser: !editForm.show_browser })}
-                      className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${
-                        editForm.show_browser ? 'bg-[#ffe100]' : 'bg-gray-300'
-                      }`}
-                    >
-                      <span
-                        className={`absolute left-1 top-1 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
-                          editForm.show_browser ? 'translate-x-5' : ''
-                        }`}
-                      />
-                    </button>
-                  </div>
-                </div>
-              </div>
             </div>
 
             <div className="modal-footer">
