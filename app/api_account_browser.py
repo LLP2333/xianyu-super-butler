@@ -128,4 +128,8 @@ def create_account_browser_router(require_operator, service, verify_session):
     async def status(account_id: str, user=Depends(require_operator)):
         return await call(service.status(account_id, user['user_id']))
 
+    @router.post('/{account_id}/fetch-credentials')
+    async def fetch_credentials(account_id: str, user=Depends(require_operator)):
+        return await call(service.fetch_credentials(account_id, user['user_id']))
+
     return router

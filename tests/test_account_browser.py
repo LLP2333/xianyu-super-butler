@@ -54,7 +54,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.service = AccountBrowserService(self.db, lambda:self.manager, self.browsers)
         def listener(key, expected, browser, callback):
             return SimpleNamespace(account_id=key, expected_account=expected, browser=browser,
-                current_account=AsyncMock(return_value='123'), start=AsyncMock(), close=AsyncMock(), close_goofish_pages=AsyncMock(),
+                current_account=AsyncMock(return_value='123'), start=AsyncMock(), close=AsyncMock(), close_goofish_pages=AsyncMock(), open_messages=AsyncMock(),
                 context=object(), task=SimpleNamespace(done=lambda:False), ready=SimpleNamespace(is_set=lambda:True), error=None)
         p=patch('app.services.account_browser.TokenListener',side_effect=listener)
         p.start();self.addCleanup(p.stop)
@@ -351,3 +351,45 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             await self.service.capture_credentials(self.capture())
         self.assertIsNone(self.store.get('123'))
         self.assertTrue(risk_control.registry.get('123').verification_required)
+
+    async def test_fetch_starts_browser_pauses_then_uses_existing_capture_handoff(self):
+        await self.service.ensure(7, '123', self.records['123'])
+        async def open_messages():
+            self.manager.pause_cookie_task.assert_awaited_once_with('123')
+            self.db.set_system_setting.assert_called_with('account_browser_stopped', 'false')
+            self.manager.resume_cookie_task.assert_not_awaited()
+        self.service.listener.open_messages.side_effect = open_messages
+        result = await self.service.fetch_credentials('123', 7)
+        self.assertTrue(result['browser_running'])
+        self.service.listener.open_messages.assert_awaited_once()
+        value = self.capture()
+        await self.service.capture_credentials(value)
+        self.assertEqual(self.records['123'], value.cookies)
+        self.assertIs(self.store.get('123'), value)
+        self.service.listener.close_goofish_pages.assert_awaited_once()
+        self.manager.resume_cookie_task.assert_awaited_once_with('123', value.cookies)
+
+    async def test_fetch_keeps_failed_page_for_manual_handling(self):
+        await self.service.ensure(7, '123', self.records['123'])
+        self.service.listener.open_messages.side_effect = RuntimeError('login overlay')
+        result = await self.service.fetch_credentials('123', 7)
+        self.assertEqual(result['credentials_state'], 'error')
+        self.assertIn('页面已保留', result['message'])
+        self.service.listener.close_goofish_pages.assert_not_awaited()
+        self.manager.resume_cookie_task.assert_not_awaited()
+        self.assertFalse(self.service.opening_messages)
+        self.service.listener.open_messages.side_effect = None
+        await self.service.fetch_credentials('123', 7)
+        self.assertNotIn('123', self.service.errors)
+
+    async def test_fetch_rejects_wrong_owner_disabled_and_duplicate(self):
+        with self.assertRaises(LookupError):
+            await self.service.fetch_credentials('123', 8)
+        self.db.get_cookie_status.return_value = False
+        with self.assertRaises(ValueError):
+            await self.service.fetch_credentials('123', 7)
+        self.db.get_cookie_status.return_value = True
+        self.service.opening_messages.add('123')
+        with self.assertRaisesRegex(ValueError, '重复'):
+            await self.service.fetch_credentials('123', 7)
+        self.manager.pause_cookie_task.assert_not_awaited()

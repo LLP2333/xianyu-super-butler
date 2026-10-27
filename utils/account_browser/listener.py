@@ -1,4 +1,4 @@
-"""Observe website-owned Token responses. Never navigate, evaluate JS or send MTOP requests."""
+"""Observe website-owned Tokens and open the message entry on explicit user request."""
 import asyncio
 import json
 from urllib.parse import parse_qs, urlsplit
@@ -98,6 +98,20 @@ class TokenListener:
         task = asyncio.create_task(self.consume(response))
         self.pending.add(task)
         task.add_done_callback(self.pending.discard)
+
+    async def open_messages(self):
+        """Click the site's own entry so its URL parameters and handlers are preserved."""
+        if self.context is None or not self.ready.is_set():
+            raise RuntimeError('浏览器监听未连接，请重连监听后重试')
+        page = next((p for p in self.context.pages
+                     if urlsplit(p.url).hostname in ('goofish.com', 'www.goofish.com')), None)
+        if page is None:
+            page = next((p for p in self.context.pages if p.url == 'about:blank'), None)
+        if page is None:
+            page = await self.context.new_page()
+        await page.goto('https://www.goofish.com/', wait_until='domcontentloaded', timeout=20000)
+        # Do not force a click through login/verification overlays or bypass the homepage.
+        await page.get_by_role('link', name='消息', exact=True).click(timeout=20000)
 
     async def close_goofish_pages(self):
         """End website messaging without closing Chrome or clearing its profile."""

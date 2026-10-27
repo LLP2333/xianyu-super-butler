@@ -316,6 +316,8 @@ export const getRiskControlStatus = async (): Promise<{
 
 export type BrowserCredentialStatus = { credentials_state: 'waiting' | 'captured' | 'connecting' | 'active' | 'error'; captured: boolean; captured_at?: number; message: string };
 export type BrowserStatus = BrowserListenerStatus & BrowserCredentialStatus & { account_id?: string; desktop_url?: string };
+export const fetchBrowserCredentials = (accountId: string): Promise<BrowserStatus> =>
+  post(`/api/account-browser/${encodeURIComponent(accountId)}/fetch-credentials`, {}, { timeout: 120000 });
 export type BrowserListenerStatus = { browser_running: boolean; listening: boolean; listener_state: 'connecting' | 'listening' | 'disconnected'; listener_error?: string };
 export const reconnectBrowserListener = (): Promise<BrowserDesktop & BrowserListenerStatus> => post('/api/account-browser/reconnect', {}, { timeout: 120000 });
 export type BrowserDesktop = { message: string; desktop_url?: string; open_url?: string };

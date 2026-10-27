@@ -24,6 +24,7 @@ class AccountBrowserService:
         self.setup_error = None
         self.errors = {}
         self.task = None
+        self.opening_messages = set()
 
     def account(self, account_id, user_id):
         record = self.db.get_cookie_details(account_id)
@@ -236,6 +237,33 @@ class AccountBrowserService:
             await self.ensure(user_id, account_id, record['value'])
             return {**self.listener_status(), **self.credential_status(account_id),
                     'desktop_url': self.desktop_url(user_id)}
+
+    async def fetch_credentials(self, account_id, user_id):
+        self.account(account_id, user_id)
+        if not self.db.get_cookie_status(account_id):
+            raise ValueError('请先启用账号')
+        if account_id in self.opening_messages:
+            raise ValueError('正在打开闲鱼消息，请勿重复点击')
+        self.opening_messages.add(account_id)
+        try:
+            async with self.browsers.lock(PRIMARY):
+                record = self.account(account_id, user_id)
+                if not self.db.get_cookie_status(account_id):
+                    raise ValueError('请先启用账号')
+                await self.pause_account(account_id, '正在打开闲鱼首页并点击消息，等待网页提供凭据', force=True)
+                self.errors.pop(account_id, None)
+                self.set_browser_stopped(False)
+                try:
+                    await self.ensure(user_id, account_id, record['value'])
+                    await self.listener.open_messages()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.errors[account_id] = '未能进入闲鱼消息页，请打开原生 Chrome 桌面检查登录或验证；页面已保留'
+                return {**self.listener_status(), **self.credential_status(account_id),
+                        'desktop_url': self.desktop_url(user_id) if self.listener_status()['browser_running'] else None}
+        finally:
+            self.opening_messages.discard(account_id)
 
     async def status(self, account_id, user_id):
         self.account(account_id, user_id)

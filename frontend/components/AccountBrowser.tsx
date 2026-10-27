@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { accountBrowserAction, accountBrowserStatus, BrowserDesktop, BrowserStatus, setupBrowserAccount,
-  browserSetupStatus, browserDesktopLink, clearBrowserData, reconnectBrowserListener, stopAccountBrowser } from '../services/api';
+  browserSetupStatus, browserDesktopLink, clearBrowserData, reconnectBrowserListener, stopAccountBrowser, fetchBrowserCredentials } from '../services/api';
 import { confirmAction } from '../services/feedback';
 import { AccountDetail } from '../types';
 
@@ -19,6 +19,7 @@ export default function AccountBrowser({ account, initialWindow, onClose, onChan
   const [statusError, setStatusError] = useState<string | null>(null);
   const [busy, setBusy] = useState(true);
   const [reconnecting, setReconnecting] = useState(false);
+  const [fetching, setFetching] = useState(false);
   const [createdId, setCreatedId] = useState<string>();
   const accountId = account?.id || createdId;
   const windowRef = useRef(initialWindow);
@@ -78,6 +79,17 @@ export default function AccountBrowser({ account, initialWindow, onClose, onChan
       setDesktop(result); setMessage(result.message); setStatus(null); onChanged();
     } catch (error) { setStatusError(errorMessage(error)); }
     finally { setBusy(false); }
+  };
+
+  const fetchCredentials = async () => {
+    if (!accountId) return;
+    setBusy(true); setFetching(true); setStatusError(null);
+    setMessage('正在打开闲鱼首页并点击消息…');
+    try {
+      const result = await fetchBrowserCredentials(accountId);
+      setDesktop(result); setStatus(result); setMessage(result.message); onChanged();
+    } catch (error) { setStatusError(errorMessage(error)); }
+    finally { setBusy(false); setFetching(false); }
   };
 
   const reconnect = async () => {
@@ -145,6 +157,7 @@ export default function AccountBrowser({ account, initialWindow, onClose, onChan
           <p className="text-sm text-gray-500">凭据过期后暂停闲鱼请求。关闭此窗口不会停止监听，也不会提前恢复任务；新凭据保存后先关闭闲鱼标签页，再由管家连接验证，浏览器登录数据保留。</p>
         </div>
         <div className="modal-footer flex flex-wrap gap-2">
+          {accountId && <button type="button" className="ios-btn-primary px-3 py-2" disabled={busy} onClick={() => void fetchCredentials()}>{fetching ? '正在打开消息…' : '获取新凭据'}</button>}
           <button type="button" className="ios-btn-primary px-3 py-2" disabled={busy || running} onClick={() => void controlBrowser(true)}>启动浏览器</button>
           <button type="button" className="ios-btn-secondary px-3 py-2" disabled={busy || !running} onClick={() => void controlBrowser(false)}>停止浏览器</button>
           <button type="button" className="ios-btn-secondary px-3 py-2" disabled={busy || !running || listening} onClick={() => void reconnect()}>{reconnecting ? '重新连接中…' : listening ? '监听正常' : '重新连接监听'}</button>

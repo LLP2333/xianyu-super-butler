@@ -4,7 +4,7 @@ import time
 import unittest
 from types import SimpleNamespace
 from urllib.parse import urlencode
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from app.config import API_ENDPOINTS
 from utils.account_browser.listener import TokenListener, token_response
 from utils.account_browser.tokens import BrowserToken, TokenStore
@@ -60,6 +60,30 @@ class StoreTests(unittest.TestCase):
 
 
 class ListenerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_open_home_then_click_actual_message_link(self):
+        link = SimpleNamespace(click=AsyncMock())
+        page = SimpleNamespace(url='about:blank', goto=AsyncMock(), get_by_role=MagicMock(return_value=link))
+        async def click(**kwargs):
+            page.goto.assert_awaited_once_with('https://www.goofish.com/', wait_until='domcontentloaded', timeout=20000)
+        link.click.side_effect = click
+        self.listener.context.pages = [page]
+        self.listener.context.new_page = AsyncMock()
+        self.listener.ready.set()
+        await self.listener.open_messages()
+        page.get_by_role.assert_called_once_with('link', name='消息', exact=True)
+        link.click.assert_awaited_once_with(timeout=20000)
+        self.listener.context.new_page.assert_not_awaited()
+
+    async def test_blocked_message_click_does_not_navigate_directly_or_close(self):
+        link = SimpleNamespace(click=AsyncMock(side_effect=RuntimeError('blocked')))
+        page = SimpleNamespace(url='https://www.goofish.com/', goto=AsyncMock(), close=AsyncMock(), get_by_role=MagicMock(return_value=link))
+        self.listener.context.pages = [page]
+        self.listener.ready.set()
+        with self.assertRaises(RuntimeError):
+            await self.listener.open_messages()
+        self.assertEqual(page.goto.await_count, 1)
+        page.close.assert_not_awaited()
+
     def setUp(self):
         self.store = TokenStore()
         self.patch = patch('utils.account_browser.listener.tokens', self.store)
