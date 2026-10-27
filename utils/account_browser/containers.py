@@ -26,7 +26,12 @@ class ContainerDesktop:
         self.auth = aiohttp.BasicAuth(environment.get('CUSTOM_USER', 'account'), environment.get('PASSWORD', ''))
 
     async def refresh(self):
-        await asyncio.to_thread(self.container.reload)
+        try:
+            await asyncio.to_thread(self.container.reload)
+        except NotFound:
+            self.alive = False
+            self.host = ''
+            return False
         self.alive = self.container.status == 'running'
         networks = self.container.attrs.get('NetworkSettings', {}).get('Networks', {})
         self.host = networks.get(self.network, {}).get('IPAddress', '')
@@ -64,9 +69,18 @@ class ContainerDesktop:
 
     async def stop(self):
         await self.refresh()
-        if self.alive:
+        if self.container.status == 'paused':
+            await asyncio.to_thread(self.container.unpause)
+            self.alive = True
+        if self.alive or self.container.status == 'restarting':
             await asyncio.to_thread(self.container.stop, timeout=15)
         self.alive = False
+
+    async def remove(self):
+        """Discard the runtime only; never delete the persistent profile volume."""
+        with suppress(NotFound):
+            await self.stop()
+            await asyncio.to_thread(self.container.remove)
 
     async def wait_for_chrome_exit(self):
         # Browser.close acknowledges before the OS process has finished writing its profile.
@@ -129,6 +143,11 @@ class ContainerPool:
         await self.initialize()
         name = self.name(account_id, owner_id)
         labels = self.labels(account_id, owner_id)
+        config = os.environ.get('ACCOUNT_BROWSER_CDP_CONFIG')
+        if not config or not Path(config).is_absolute():
+            raise RuntimeError('请设置 ACCOUNT_BROWSER_CDP_CONFIG 为 Docker 宿主机上 cdp.conf 的绝对路径')
+        network = await asyncio.to_thread(self.client.networks.get, self.network)
+        volume_name = name + '-config'
         try:
             image = await asyncio.to_thread(self.client.images.get, self.image)
         except NotFound as exc:
@@ -139,21 +158,26 @@ class ContainerPool:
                 raise RuntimeError('同名容器不属于当前账号，拒绝接管')
             bindings = container.attrs.get('HostConfig', {}).get('PortBindings', {})
             expected_bindings = {'3000/tcp': [{'HostIp': os.environ.get('ACCOUNT_BROWSER_BIND', '127.0.0.1'), 'HostPort': '3000'}]}
-            if (container.attrs.get('Image') != image.id
+            endpoint = container.attrs.get('NetworkSettings', {}).get('Networks', {}).get(self.network, {})
+            mounts = {m['Destination']: m for m in container.attrs.get('Mounts', [])}
+            profile = mounts.get('/config', {})
+            cdp = mounts.get('/etc/nginx/conf.d/account-browser-cdp.conf', {})
+            if (container.status != 'running'
+                    or container.attrs.get('Image') != image.id
                     or container.labels.get(LABEL + '.desktop-auth') != 'session-v1'
-                    or bindings != expected_bindings):
+                    or bindings != expected_bindings
+                    or endpoint.get('NetworkID') != network.id
+                    or not endpoint.get('IPAddress')
+                    or profile.get('Type') != 'volume' or profile.get('Name') != volume_name
+                    or not profile.get('RW')
+                    or cdp.get('Source') != config or cdp.get('RW') is not False):
                 desktop = ContainerDesktop(container, self.network)
-                await desktop.stop()
                 # Container metadata is replaceable; its named /config volume is retained.
-                await asyncio.to_thread(container.remove)
+                await desktop.remove()
                 container = None
         except NotFound:
             container = None
         if container is None:
-            config = os.environ.get('ACCOUNT_BROWSER_CDP_CONFIG')
-            if not config or not Path(config).is_absolute():
-                raise RuntimeError('请设置 ACCOUNT_BROWSER_CDP_CONFIG 为 Docker 宿主机上 cdp.conf 的绝对路径')
-            volume_name = name + '-config'
             try:
                 volume = await asyncio.to_thread(self.client.volumes.get, volume_name)
                 if any((volume.attrs.get('Labels') or {}).get(key) != value for key, value in labels.items()):
@@ -187,14 +211,14 @@ class ContainerPool:
                 info.size, info.mode, info.uid, info.gid = len(data), 0o755, 0, 0
                 output.addfile(info, io.BytesIO(data))
             await asyncio.to_thread(container.put_archive, '/', archive.getvalue())
-        if container.status != 'running':
-            await asyncio.to_thread(container.start)
         desktop = ContainerDesktop(container, self.network)
         try:
+            if container.status != 'running':
+                await asyncio.to_thread(container.start)
             await desktop.ready()
         except BaseException:
             with suppress(Exception):
-                await desktop.stop()
+                await desktop.remove()
             raise
         return desktop
 

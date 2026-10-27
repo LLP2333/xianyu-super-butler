@@ -309,13 +309,15 @@ class AccountBrowserService:
                 await self.ensure(record['user_id'], account_id, record['value'])
 
     async def run(self):
+        failures = 0
         while True:
             try:
                 await self.reconcile()
+                failures = 0
             except Exception as exc:
-                message = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else type(exc).__name__
-                logger.warning(f'账号浏览器管理异常: {message}')
-            await asyncio.sleep(2)
+                failures += 1
+                logger.warning(f'账号浏览器管理异常: {type(exc).__name__}: {exc}')
+            await asyncio.sleep(min(60, 2 ** min(failures + 1, 6)))
 
     def start(self):
         self.task = asyncio.create_task(self.run(), name='account-browser')

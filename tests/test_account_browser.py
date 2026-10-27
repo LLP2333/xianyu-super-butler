@@ -10,6 +10,19 @@ from utils import risk_control
 
 
 class ServiceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reconcile_failures_back_off_and_success_resets_delay(self):
+        service = AccountBrowserService(MagicMock(), MagicMock())
+        service.reconcile = AsyncMock(side_effect=[RuntimeError('network missing')] * 7 + [None])
+        delays = []
+        async def sleep(delay):
+            delays.append(delay)
+            if len(delays) == 8:
+                raise asyncio.CancelledError()
+        with patch('app.services.account_browser.asyncio.sleep', sleep):
+            with self.assertRaises(asyncio.CancelledError):
+                await service.run()
+        self.assertEqual(delays, [4, 8, 16, 32, 60, 60, 60, 2])
+
     def setUp(self):
         self.store = TokenStore()
         p = patch('app.services.account_browser.tokens', self.store)

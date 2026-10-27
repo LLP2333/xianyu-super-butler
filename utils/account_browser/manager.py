@@ -46,7 +46,7 @@ class AccountBrowser:
                     session = await context.browser.new_browser_cdp_session()
                     await session.send('Browser.close')
                 await self.desktop.wait_for_chrome_exit()
-        await self.desktop.stop()
+        await self.desktop.remove()
 
 
 class BrowserManager:
@@ -74,10 +74,11 @@ class BrowserManager:
         """Caller owns the account lock. Chrome owns its cookies; never seed old ones."""
         await self.discover()
         browser = self.browsers.get(account_id)
+        if browser and browser.owner_id != owner_id:
+            raise RuntimeError('浏览器不属于当前用户，拒绝接管')
         if (browser and account_id in self.checked and browser.owner_id == owner_id
                 and await browser.desktop.refresh()):
             return browser
-        await self.stop(account_id)
         desktop = await self.pool.ensure(account_id, owner_id)
         browser = AccountBrowser(desktop, owner_id)
         self.browsers[account_id] = browser

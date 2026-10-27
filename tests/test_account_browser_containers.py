@@ -1,13 +1,14 @@
 """Docker lifecycle contracts, without exposing a host Docker socket to tests."""
 import tempfile
+from contextlib import asynccontextmanager
 import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from docker.errors import NotFound
+from docker.errors import NotFound, APIError
 from utils.account_browser.containers import ContainerPool, ContainerDesktop, LABEL
-from utils.account_browser.manager import BrowserManager
+from utils.account_browser.manager import BrowserManager, AccountBrowser
 
 
 class PoolTests(unittest.IsolatedAsyncioTestCase):
@@ -63,15 +64,81 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.pool.client.containers.create.assert_not_called()
 
     async def test_existing_running_container_is_reused(self):
+        self.existing_container()
+        await self.pool.ensure('a', 7)
+        self.container.start.assert_not_called()
+        self.pool.client.containers.create.assert_not_called()
+
+    def existing_container(self):
         self.container.status = 'running'
         self.container.labels = {**self.pool.labels('a', 7), LABEL + '.desktop-auth': 'session-v1'}
         self.container.attrs['Image'] = 'sha256:new'
         self.container.attrs['HostConfig'] = {'PortBindings': {'3000/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '3000'}]}}
+        self.pool.client.networks.get.return_value.id = 'network-current'
+        self.container.attrs['NetworkSettings'] = {'Networks': {'isolated-test': {
+            'NetworkID': 'network-current', 'IPAddress': '172.20.0.2'}}}
+        self.container.attrs['Mounts'] = [
+            {'Destination': '/config', 'Type': 'volume', 'Name': self.pool.name('a', 7) + '-config', 'RW': True},
+            {'Destination': '/etc/nginx/conf.d/account-browser-cdp.conf', 'Source': '/host/cdp.conf', 'RW': False},
+        ]
         self.pool.client.containers.get.side_effect = None
         self.pool.client.containers.get.return_value = self.container
+
+    async def test_exited_container_recreated_with_original_profile_volume(self):
+        self.existing_container()
+        self.container.status = 'exited'
+        volume = MagicMock()
+        volume.attrs = {'Labels': self.pool.labels('a', 7)}
+        self.pool.client.volumes.get.side_effect = None
+        self.pool.client.volumes.get.return_value = volume
+        replacement = MagicMock(status='created', attrs={})
+        self.pool.client.containers.create.return_value = replacement
         await self.pool.ensure('a', 7)
+        self.container.remove.assert_called_once_with()
         self.container.start.assert_not_called()
-        self.pool.client.containers.create.assert_not_called()
+        replacement.start.assert_called_once()
+        self.pool.client.volumes.create.assert_not_called()
+        volume.remove.assert_not_called()
+        mounts = self.pool.client.containers.create.call_args.kwargs['volumes']
+        self.assertEqual(mounts[self.pool.name('a', 7) + '-config'], {'bind': '/config', 'mode': 'rw'})
+
+    async def test_recreated_network_replaces_old_container(self):
+        self.existing_container()
+        self.container.attrs['NetworkSettings']['Networks']['isolated-test']['NetworkID'] = 'network-deleted'
+        await self.pool.ensure('a', 7)
+        self.container.remove.assert_called_once_with()
+        self.pool.client.containers.create.assert_called_once()
+
+    async def test_changed_config_mount_replaces_old_container(self):
+        self.existing_container()
+        self.container.attrs['Mounts'][1]['Source'] = '/old/cdp.conf'
+        await self.pool.ensure('a', 7)
+        self.container.remove.assert_called_once_with()
+        self.pool.client.containers.create.assert_called_once()
+
+    async def test_paused_container_is_unpaused_before_removal(self):
+        self.existing_container()
+        self.container.status = 'paused'
+        await self.pool.ensure('a', 7)
+        calls = self.container.method_calls
+        names = [call[0] for call in calls]
+        self.assertLess(names.index('unpause'), names.index('stop'))
+        self.assertLess(names.index('stop'), names.index('remove'))
+
+    async def test_start_error_removes_failed_runtime_and_preserves_volume(self):
+        self.container.start.side_effect = APIError('network unavailable')
+        with self.assertRaisesRegex(APIError, 'network unavailable'):
+            await self.pool.ensure('a', 7)
+        self.container.remove.assert_called_once_with()
+        self.pool.client.volumes.prune.assert_not_called()
+        self.pool.client.volumes.get.return_value.remove.assert_not_called()
+
+    async def test_externally_removed_container_is_not_treated_as_alive(self):
+        self.container.reload.side_effect = NotFound('removed')
+        desktop = ContainerDesktop(self.container, 'isolated-test')
+        desktop.alive = True
+        self.assertFalse(await desktop.refresh())
+        self.assertFalse(desktop.alive)
 
     async def test_new_image_replaces_container_but_retains_named_volume(self):
         self.container.status = 'exited'
@@ -156,14 +223,43 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
 class ManagerTests(unittest.IsolatedAsyncioTestCase):
     async def test_browser_restart_preserves_pool_identity_and_no_cookie_seeding(self):
         manager = BrowserManager('/tmp/unused-browser-manager-tests')
-        desktop = SimpleNamespace(alive=True, refresh=AsyncMock(return_value=True), stop=AsyncMock())
+        desktop = SimpleNamespace(alive=True, refresh=AsyncMock(return_value=True), remove=AsyncMock())
         manager.pool = SimpleNamespace(discover=AsyncMock(return_value=[]), ensure=AsyncMock(return_value=desktop), close=AsyncMock())
         first = await manager.ensure('a', 7)
         self.assertIs(await manager.ensure('a', 7), first)
         manager.pool.ensure.assert_awaited_once_with('a', 7)
         await manager.stop('a')
-        desktop.stop.assert_awaited_once()
+        desktop.remove.assert_awaited_once()
         self.assertIsNot(await manager.ensure('a', 7), first)
         self.assertEqual(manager.pool.ensure.await_count, 2)
         await manager.close()
         manager.pool.close.assert_awaited_once()
+
+    async def test_discovered_running_browser_is_adopted_without_stopping(self):
+        manager = BrowserManager('/tmp/unused-browser-manager-tests')
+        desktop = SimpleNamespace(alive=True, refresh=AsyncMock(return_value=True), remove=AsyncMock())
+        manager.pool = SimpleNamespace(discover=AsyncMock(return_value=[('a', 7, desktop)]),
+                                       ensure=AsyncMock(return_value=desktop))
+        browser = await manager.ensure('a', 7)
+        self.assertIs(browser.desktop, desktop)
+        manager.pool.ensure.assert_awaited_once_with('a', 7)
+        desktop.remove.assert_not_awaited()
+
+    async def test_shutdown_flushes_chrome_before_removing_runtime(self):
+        events = []
+        async def send(command):
+            events.append(command)
+        async def wait():
+            events.append('flushed')
+        async def remove():
+            events.append('removed')
+        desktop = SimpleNamespace(wait_for_chrome_exit=wait, remove=remove)
+        browser = AccountBrowser(desktop, 7)
+        session = SimpleNamespace(send=send)
+        context = SimpleNamespace(browser=SimpleNamespace(new_browser_cdp_session=AsyncMock(return_value=session)))
+        @asynccontextmanager
+        async def connect():
+            yield context
+        with patch.object(browser, 'connect', connect):
+            await browser.close()
+        self.assertEqual(events, ['Browser.close', 'flushed', 'removed'])
