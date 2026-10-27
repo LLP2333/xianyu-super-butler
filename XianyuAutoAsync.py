@@ -2078,7 +2078,6 @@ class XianyuLive:
                 cookie_id=self.cookie_id, event_type='slider_captcha',
                 event_description=reason, processing_status='pending',
             )
-            await self.send_token_refresh_notification(reason, 'captcha_manual_required')
         except Exception as exc:
             logger.warning(f'【{self.cookie_id}】记录人工验证提示失败: {type(exc).__name__}')
 

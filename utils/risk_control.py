@@ -86,10 +86,14 @@ class AccountGuard:
         return cooldown
 
     def require_verification(self, reason: str) -> None:
+        newly_required = not self.verification_required
         self.verification_required = True
         self.blocked_until = 0.0
         self.last_hit_reason = reason
         logger.warning(f'【{self.cookie_id}】等待人工验证，停止自动重试')
+        if newly_required:
+            from app.services.risk_notifications import schedule_manual_verification_notification
+            schedule_manual_verification_notification(self.cookie_id, reason)
 
     def reset(self, *, verified: bool = False) -> None:
         """请求成功，解除熔断计数。"""

@@ -31,7 +31,7 @@ class AutomaticVerificationTests(unittest.IsolatedAsyncioTestCase):
         registry = risk_control.RiskControlRegistry()
         db = MagicMock()
         instance = SimpleNamespace(cookie_id='account', send_token_refresh_notification=AsyncMock())
-        with patch.object(risk_control, 'registry', registry), patch.dict('sys.modules', {
+        with patch('app.services.risk_notifications.schedule_manual_verification_notification') as notify, patch.object(risk_control, 'registry', registry), patch.dict('sys.modules', {
             'app.db_manager': SimpleNamespace(db_manager=db),
             'utils.xianyu_slider_stealth': None,
         }):
@@ -40,7 +40,8 @@ class AutomaticVerificationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(registry.get('account').is_blocked)
         self.assertEqual(instance.last_token_refresh_status, 'manual_verification_required')
         db.add_risk_control_log.assert_called_once()
-        instance.send_token_refresh_notification.assert_awaited_once()
+        notify.assert_called_once_with('account', registry.get('account').last_hit_reason)
+        instance.send_token_refresh_notification.assert_not_awaited()
 
 
 if __name__ == '__main__':
