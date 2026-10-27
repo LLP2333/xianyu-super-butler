@@ -191,8 +191,8 @@ const Settings: React.FC = () => {
     if (customBrowserAddress) {
       try {
         const url = new URL(settings.browser_desktop_url || '');
-        if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/') throw new Error();
-      } catch { notify('请填写 HTTPS 根地址，例如 https://browser.example.com'); return; }
+        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash || url.pathname !== '/') throw new Error();
+      } catch { notify('请填写 HTTP 或 HTTPS 根地址，例如 https://browser.example.com'); return; }
     }
     setSaving(true);
     try {
@@ -284,7 +284,7 @@ const Settings: React.FC = () => {
               <label><span className="field-label">访问方式</span>
                 <select className="ios-input w-full px-3 py-2" value={customBrowserAddress ? 'custom' : 'local'}
                   onChange={event => { const custom = event.target.value === 'custom'; setCustomBrowserAddress(custom); if (!custom) setSettings({ ...settings, browser_desktop_url: '' }); }}>
-                  <option value="local">本地地址（默认 https://localhost:3001）</option>
+                  <option value="local">本地地址（默认 http://localhost:3000）</option>
                   <option value="custom">自定义域名地址</option>
                 </select>
               </label>

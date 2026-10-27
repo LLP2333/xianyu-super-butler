@@ -38,13 +38,13 @@ class ContainerDesktop:
 
     @property
     def desktop_url(self):
-        ports = self.container.attrs.get('NetworkSettings', {}).get('Ports', {}).get('3001/tcp') or []
+        ports = self.container.attrs.get('NetworkSettings', {}).get('Ports', {}).get('3000/tcp') or []
         if not ports:
             raise RuntimeError('原生桌面端口未发布，请重新创建账号浏览器')
         host = os.environ.get('ACCOUNT_BROWSER_HOST', 'localhost')
         if ':' in host and not host.startswith('['):
             host = f'[{host}]'
-        return f"https://{host}:{ports[0]['HostPort']}/"
+        return f"http://{host}:{ports[0]['HostPort']}/"
 
     async def ready(self):
         async with aiohttp.ClientSession(auth=self.auth, timeout=aiohttp.ClientTimeout(total=3)) as client:
@@ -137,7 +137,11 @@ class ContainerPool:
             container = await asyncio.to_thread(self.client.containers.get, name)
             if any(container.labels.get(key) != value for key, value in labels.items()):
                 raise RuntimeError('同名容器不属于当前账号，拒绝接管')
-            if container.attrs.get('Image') != image.id or container.labels.get(LABEL + '.desktop-auth') != 'session-v1':
+            bindings = container.attrs.get('HostConfig', {}).get('PortBindings', {})
+            expected_bindings = {'3000/tcp': [{'HostIp': os.environ.get('ACCOUNT_BROWSER_BIND', '127.0.0.1'), 'HostPort': '3000'}]}
+            if (container.attrs.get('Image') != image.id
+                    or container.labels.get(LABEL + '.desktop-auth') != 'session-v1'
+                    or bindings != expected_bindings):
                 desktop = ContainerDesktop(container, self.network)
                 await desktop.stop()
                 # Container metadata is replaceable; its named /config volume is retained.
@@ -159,7 +163,7 @@ class ContainerPool:
             container = await asyncio.to_thread(
                 self.client.containers.create, self.image, name=name, labels={**labels, LABEL + '.desktop-auth': 'session-v1'},
                 network=self.network, shm_size='1g',
-                ports={'3001/tcp': (os.environ.get('ACCOUNT_BROWSER_BIND', '127.0.0.1'), 3001)},
+                ports={'3000/tcp': (os.environ.get('ACCOUNT_BROWSER_BIND', '127.0.0.1'), 3000)},
                 volumes={volume_name: {'bind': '/config', 'mode': 'rw'},
                          config: {'bind': '/etc/nginx/conf.d/account-browser-cdp.conf', 'mode': 'ro'}},
                 environment={
@@ -170,7 +174,7 @@ class ContainerPool:
                     'CHROME_CLI': '--remote-debugging-port=9222 --user-data-dir=/config/browser '
                                   '--restore-last-session ' + self.start_url,
                 },
-                # Only the native HTTPS desktop is published. CDP stays on the private network.
+                # Only the native HTTP desktop is published; the tunnel terminates HTTPS. CDP stays on the private network.
                 restart_policy={'Name': 'no'},
                 log_config=docker.types.LogConfig(type='json-file', config={'max-size': '10m', 'max-file': '2'}),
             )

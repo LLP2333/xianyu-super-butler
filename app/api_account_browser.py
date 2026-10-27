@@ -2,7 +2,7 @@
 import asyncio
 import secrets
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from starlette.responses import JSONResponse, RedirectResponse, Response
@@ -89,7 +89,8 @@ def create_account_browser_router(require_operator, service, verify_session):
         session = secrets.token_urlsafe(32)
         sessions[session] = (entry[0], entry[1], time.monotonic() + 3600, entry[3])
         response = RedirectResponse('/', status_code=303, headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
-        response.set_cookie('xianyu_desktop', session, max_age=3600, path='/', secure=True, httponly=True, samesite='lax')
+        secure = urlsplit(service.desktop_url(browser.owner_id)).scheme == 'https'
+        response.set_cookie('xianyu_desktop', session, max_age=3600, path='/', secure=secure, httponly=True, samesite='lax')
         return response
 
     @router.get('/desktop-auth')

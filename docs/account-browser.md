@@ -1,6 +1,6 @@
 # 单账号原生浏览器登录
 
-账号管理先使用一个账号、一份浏览器资料和固定 HTTPS 端口 `3001`。桌面由官方 `lscr.io/linuxserver/chrome:latest` 直接提供，管家不转发画面或鼠标输入，不主动请求闲鱼消息 Token。
+账号管理先使用一个账号、一份浏览器资料和固定 HTTP 端口 `3000`。桌面由官方 `lscr.io/linuxserver/chrome:latest` 直接提供，管家不转发画面或鼠标输入，不主动请求闲鱼消息 Token。
 
 ## 目录与职责
 
@@ -32,7 +32,7 @@ deploy/account-browser/
 ```text
 点击“浏览器添加账号”
   → 启动 primary 原生浏览器（此时数据库中还没有闲鱼账号）
-  → 建立只读监听 → 一次性链接打开 https://localhost:3001
+  → 建立只读监听 → 一次性链接打开 http://localhost:3000
   → 用户在 Chrome 中登录、完成网站验证、打开 www.goofish.com/im
   → 网页自行获取消息 Token
   → 核对请求 Cookie 的 unb 与当前 Cookie 的 unb 一致
@@ -65,7 +65,7 @@ deploy/account-browser/
 | 闲鱼 Cookie | 账号登录状态以及其他账号业务请求 | 捕获并核对后保存在账号数据库 |
 | 闲鱼消息 Token | 管家的聊天连接注册 | 仅内存保存，不下发前端、不写日志；到期或被拒绝后等待网页新 Token |
 
-桌面票据不包含闲鱼 Cookie、消息 Token、管家登录 Token或内部调试密码。兑换后使用 Secure、HttpOnly、SameSite=Lax 的桌面会话 Cookie，访问期限一小时；管理员退出登录或容器重建后，新请求不能继续访问。已经建立的原生 WebSocket 不会因票据到期自动断开，关闭/重启浏览器会终止连接。
+桌面票据不包含闲鱼 Cookie、消息 Token、管家登录 Token或内部调试密码。兑换后使用 HttpOnly、SameSite=Lax 的桌面会话 Cookie；访问地址为 HTTPS 时同时设置 Secure，访问期限一小时；管理员退出登录或容器重建后，新请求不能继续访问。已经建立的原生 WebSocket 不会因票据到期自动断开，关闭/重启浏览器会终止连接。
 
 桌面 nginx 在本容器内检查会话，静态资源和 WebSocket 仍直接由原版 Selkies 提供。仅认证请求访问管家；画面与输入不经过管家。CDP 仍有独立 Basic Auth，仅在 Docker 内网可达，不公开端口或密码。
 
@@ -76,7 +76,7 @@ deploy/account-browser/
 1. 暂停账号任务，撤销内存消息 Token；已有账号保留身份和业务设置，清除已保存的旧登录 Cookie。
 2. 关闭该浏览器和监听。
 3. 校验部署及用户归属，只删除该 `primary` 容器的 `/config` 命名数据卷。
-4. 创建干净浏览器，固定端口仍为 `3001`。用户重新登录。
+4. 创建干净浏览器，固定端口仍为 `3000`。用户重新登录。
 
 清空范围包括 Chrome 登录资料、Cookie、缓存、本地存储、历史等 `/config` 内数据；不会删除账号设置、商品、订单或其他浏览器的历史数据卷。没有点击确认不会清空。
 
@@ -95,10 +95,10 @@ docker compose up -d
 | ACCOUNT_BROWSER_NETWORK | xianyu-browsers | 浏览器与管家使用的 Docker 网络 |
 | ACCOUNT_BROWSER_CDP_CONFIG | Compose 目录下 deploy/account-browser/cdp.conf | Docker 宿主机上的绝对路径 |
 | ACCOUNT_BROWSER_API_URL | http://xianyu-app:8080 | 浏览器容器可访问的管家内网地址，用于桌面认证 |
-| ACCOUNT_BROWSER_BIND | 127.0.0.1 | 固定宿主端口 3001 的绑定地址 |
+| ACCOUNT_BROWSER_BIND | 127.0.0.1 | 固定宿主端口 3000 的绑定地址 |
 | ACCOUNT_BROWSER_HOST | localhost | 用户看到的桌面主机名 |
 
-NAS 使用 `docker-compose.nas.yml`，设置正确宿主机配置路径、绑定地址和主机名。`3001` 必须未被其他服务占用；不会自动改成随机端口。镜像自签名证书提示仍由用户核对地址后处理，一次性链接不绕过浏览器证书检查。
+NAS 使用 `docker-compose.nas.yml`，设置正确宿主机配置路径、绑定地址和主机名。`3000` 必须未被其他服务占用；不会自动改成随机端口。更新后重启管家，再启动浏览器，旧端口容器会重建并复用原有 `/config` 资料卷，不需要清空登录数据。
 
 镜像仅增加启动参数、持久资料卷、只读 CDP 配置，以及一个[官方支持的 `/custom-cont-init.d/` 初始化脚本](https://docs.linuxserver.io/general/container-customization/)。初始化脚本以 root 所有权安装到容器，修改桌面认证而不改写原生静态资源或输入协议。脚本失败时不会撤掉原有认证；健康检查失败后管家停止该容器。
 
@@ -114,7 +114,23 @@ NAS 使用 `docker-compose.nas.yml`，设置正确宿主机配置路径、绑定
 
 ## 本地与外网地址
 
-系统配置 → 账号与同步 → 原生浏览器访问地址，可选择本地地址或自定义 HTTPS 根地址（例如 `https://browser.example.com`）。空配置使用部署环境的本地地址；自定义地址同时用于弹窗显示和一次性桌面授权链接，不改变内部 CDP 连接。域名需要配置 HTTPS 和 WebSocket 转发到同一个原生浏览器的 3001 端口，不支持子路径部署。保存后重新打开桌面即可生效。
+系统配置 → 账号与同步 → 原生浏览器访问地址，可选择本地地址或自定义 HTTP/HTTPS 根地址（例如 `https://browser.example.com`）。空配置使用部署环境的本地地址；自定义地址同时用于弹窗显示和一次性桌面授权链接，不改变内部 CDP 连接。域名需要配置 HTTPS，反向代理通过 HTTP 和 WebSocket 转发到同一个原生浏览器的 3000 端口，不支持子路径部署。保存后重新打开桌面即可生效。
+
+### Cloudflare Tunnel
+
+```text
+用户浏览器 → https://browser.example.com
+           → Cloudflare Tunnel → http://127.0.0.1:3000
+                              → Chrome 容器:3000
+Chrome 容器 → Docker 内网 → 管家:8080（授权校验）
+管家 → Docker 内网 → Chrome 容器:9223（CDP）
+```
+
+Tunnel 运行在 Docker 宿主机时，公开主机名设置为 `browser.example.com`，服务类型选 **HTTP**，URL 填 `127.0.0.1:3000`。管家系统设置中的桌面地址填 `https://browser.example.com`，然后从管家点击打开桌面，取得一次性授权。直接打开域名且没有桌面会话时返回未授权属于正常行为。
+
+Tunnel 如果运行在独立 Docker 容器中，`127.0.0.1` 指向 Tunnel 自身。此时将 `ACCOUNT_BROWSER_BIND` 设置为宿主机可达的网卡地址（或 `0.0.0.0`），重启管家并重新启动浏览器，Tunnel 服务地址使用 `http://宿主机可达地址:3000`。
+
+源站无需 HTTPS，也无需关闭证书校验。外部访问继续使用 HTTPS，保证桌面音视频所需的浏览器安全上下文；直接通过远程 IP 的 HTTP 访问可能无法正常使用这些功能。
 
 ## 监听状态
 

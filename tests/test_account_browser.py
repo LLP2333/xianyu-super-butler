@@ -34,7 +34,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.db.create_browser_account.side_effect = create
         self.manager = SimpleNamespace(pause_cookie_task=AsyncMock(), resume_cookie_task=AsyncMock(), instances={})
         self.browser = SimpleNamespace(alive=True, owner_id=7, desktop=SimpleNamespace(
-            desktop_url='https://localhost:3001/', auth=aiohttp.BasicAuth('account','secret')))
+            desktop_url='http://localhost:3000/', auth=aiohttp.BasicAuth('account','secret')))
         self.lock = asyncio.Lock()
         self.browsers = SimpleNamespace(lock=lambda key:self.lock, ensure=AsyncMock(return_value=self.browser),
             stop=AsyncMock(), discover=AsyncMock(), browsers={PRIMARY:self.browser}, pool=SimpleNamespace(clear_profile=AsyncMock()))
@@ -122,7 +122,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.records.clear()
         self.assertEqual((await self.service.setup(7))['desktop_url'], 'https://browser.example.com:9443/')
         self.db.get_system_setting.return_value = ''
-        self.assertEqual(self.service.desktop_url(7), 'https://localhost:3001/')
+        self.assertEqual(self.service.desktop_url(7), 'http://localhost:3000/')
         with self.assertRaises(LookupError): self.service.desktop_url(8)
 
     def capture(self, account='123'):
@@ -133,7 +133,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_open_reuses_primary_browser_and_pauses_once(self):
         result=await self.service.takeover('123',7)
         await self.service.takeover('123',7)
-        self.assertEqual(result['desktop_url'],'https://localhost:3001/')
+        self.assertEqual(result['desktop_url'],'http://localhost:3000/')
         self.assertNotIn('password',result)
         self.manager.pause_cookie_task.assert_awaited_once_with('123')
         self.browsers.ensure.assert_awaited_with(PRIMARY,7)

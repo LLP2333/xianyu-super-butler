@@ -35,7 +35,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         kwargs = self.pool.client.containers.create.call_args.kwargs
         self.assertEqual(kwargs['shm_size'], '1g')
         self.assertEqual(kwargs['network'], 'isolated-test')
-        self.assertEqual(kwargs['ports'], {'3001/tcp': ('127.0.0.1', 3001)})
+        self.assertEqual(kwargs['ports'], {'3000/tcp': ('127.0.0.1', 3000)})
         self.assertNotIn('privileged', kwargs)
         self.assertNotIn('docker.sock', str(kwargs['volumes']))
         self.assertIn({'bind': '/config', 'mode': 'rw'}, kwargs['volumes'].values())
@@ -66,6 +66,7 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         self.container.status = 'running'
         self.container.labels = {**self.pool.labels('a', 7), LABEL + '.desktop-auth': 'session-v1'}
         self.container.attrs['Image'] = 'sha256:new'
+        self.container.attrs['HostConfig'] = {'PortBindings': {'3000/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '3000'}]}}
         self.pool.client.containers.get.side_effect = None
         self.pool.client.containers.get.return_value = self.container
         await self.pool.ensure('a', 7)
@@ -83,6 +84,25 @@ class PoolTests(unittest.IsolatedAsyncioTestCase):
         stop.assert_awaited_once()
         self.container.remove.assert_called_once_with()
         self.pool.client.volumes.prune.assert_not_called()
+
+    async def test_https_container_is_replaced_without_removing_profile(self):
+        self.container.status = 'exited'
+        self.container.labels = {**self.pool.labels('a', 7), LABEL + '.desktop-auth': 'session-v1'}
+        self.container.attrs['Image'] = 'sha256:new'
+        self.container.attrs['HostConfig'] = {'PortBindings': {'3001/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '3001'}]}}
+        self.pool.client.containers.get.side_effect = None
+        self.pool.client.containers.get.return_value = self.container
+        with patch('utils.account_browser.containers.ContainerDesktop.stop', AsyncMock()):
+            await self.pool.ensure('a', 7)
+        self.container.remove.assert_called_once_with()
+        self.pool.client.containers.create.assert_called_once()
+        self.pool.client.volumes.get.assert_called_once_with(self.pool.name('a', 7) + '-config')
+        self.pool.client.volumes.prune.assert_not_called()
+
+    async def test_desktop_url_uses_published_http_port(self):
+        self.container.attrs['NetworkSettings'] = {'Ports': {'3000/tcp': [{'HostPort': '3000'}]}}
+        with patch.dict(os.environ, {'ACCOUNT_BROWSER_HOST': 'localhost'}):
+            self.assertEqual(ContainerDesktop(self.container, 'test').desktop_url, 'http://localhost:3000/')
 
     async def test_startup_failure_stops_only_the_failed_desktop(self):
         with patch('utils.account_browser.containers.ContainerDesktop.ready', AsyncMock(side_effect=RuntimeError('not ready'))):

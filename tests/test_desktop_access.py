@@ -14,7 +14,7 @@ class DesktopAccessTests(unittest.TestCase):
     def setUp(self):
         self.logged_in=True
         self.browser=SimpleNamespace(owner_id=7,desktop=SimpleNamespace(
-            desktop_url='https://localhost:3001/',auth=aiohttp.BasicAuth('account','internal-key')))
+            desktop_url='http://localhost:3000/',auth=aiohttp.BasicAuth('account','internal-key')))
         self.service=SimpleNamespace(desktop=lambda *_:self.browser,desktop_url=lambda *_:self.browser.desktop.desktop_url,clear=AsyncMock(return_value={'message':'cleared'}))
         def auth():
             if not self.logged_in: raise HTTPException(403,'denied')
@@ -36,10 +36,10 @@ class DesktopAccessTests(unittest.TestCase):
         return self.client.get('/api/account-browser/desktop-entry',headers={
             'x-desktop-key':key,'x-desktop-ticket':ticket},follow_redirects=False)
 
-    def test_single_use_link_becomes_secure_session_and_removes_ticket_from_url(self):
+    def test_http_link_becomes_session_and_removes_ticket_from_url(self):
         ticket=self.grant();r=self.enter(ticket)
         self.assertEqual(r.status_code,303);self.assertEqual(r.headers['location'],'/')
-        self.assertIn('HttpOnly',r.headers['set-cookie']);self.assertIn('Secure',r.headers['set-cookie'])
+        self.assertIn('HttpOnly',r.headers['set-cookie']);self.assertNotIn('Secure',r.headers['set-cookie'])
         cookie=SimpleCookie();cookie.load(r.headers['set-cookie'])
         session=cookie['xianyu_desktop'].value
         self.assertNotEqual(session,ticket)
@@ -69,7 +69,9 @@ class DesktopAccessTests(unittest.TestCase):
         response = self.client.post('/api/account-browser/desktop-link', headers={'authorization':'Bearer app-session'})
         self.assertTrue(response.json()['open_url'].startswith('https://browser.example.com/_desktop_open?ticket='))
         ticket = parse_qs(urlsplit(response.json()['open_url']).query)['ticket'][0]
-        self.assertEqual(self.enter(ticket).status_code,303)
+        entered = self.enter(ticket)
+        self.assertEqual(entered.status_code,303)
+        self.assertIn('Secure', entered.headers['set-cookie'])
 
     def test_bad_container_key_cannot_consume_ticket(self):
         ticket=self.grant()
