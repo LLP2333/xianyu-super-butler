@@ -72,6 +72,65 @@ class ListenerTests(unittest.IsolatedAsyncioTestCase):
                                     all_headers=AsyncMock(return_value={'cookie':'unb=123'})),
             json=AsyncMock(return_value={'data':{'accessToken':'native-token'}}))
 
+    async def test_closes_all_goofish_tabs_and_keeps_profile_and_other_tabs(self):
+        context = SimpleNamespace(pages=[], new_page=AsyncMock())
+        def page(url):
+            result = SimpleNamespace(url=url)
+            async def close(**kwargs):
+                context.pages.remove(result)
+            result.close = AsyncMock(side_effect=close)
+            context.pages.append(result)
+            return result
+        first = page('https://www.goofish.com/im')
+        second = page('https://goofish.com/')
+        other = page('https://example.com/')
+        self.listener.context = context
+        value = BrowserToken('123', 'token', 'device', 'app', 'unb=123')
+        self.store.observe('a', value)
+        self.store.approve('a', value)
+        await self.listener.close_goofish_pages()
+        self.assertEqual(context.pages, [other])
+        first.close.assert_awaited_once_with(run_before_unload=False)
+        second.close.assert_awaited_once_with(run_before_unload=False)
+        context.new_page.assert_not_awaited()
+        self.assertIs(self.store.get('a'), value)
+
+    async def test_last_goofish_tab_gets_blank_replacement_before_closing(self):
+        page = SimpleNamespace(url='https://www.goofish.com/im')
+        context = SimpleNamespace(pages=[page])
+        async def new_page():
+            context.pages.append(SimpleNamespace(url='about:blank'))
+        async def close(**kwargs):
+            self.assertEqual(len(context.pages), 2)
+            context.pages.remove(page)
+        context.new_page = AsyncMock(side_effect=new_page)
+        page.close = AsyncMock(side_effect=close)
+        self.listener.context = context
+        await self.listener.close_goofish_pages()
+        self.assertEqual([p.url for p in context.pages], ['about:blank'])
+
+    async def test_remaining_goofish_tab_blocks_handoff(self):
+        page = SimpleNamespace(url='https://www.goofish.com/im', close=AsyncMock())
+        self.listener.context = SimpleNamespace(pages=[page], new_page=AsyncMock())
+        with self.assertRaisesRegex(RuntimeError, '未全部关闭'):
+            await self.listener.close_goofish_pages()
+
+    async def test_listener_exit_keeps_adopted_token_and_discards_new_candidate(self):
+        from contextlib import asynccontextmanager
+        value = BrowserToken('123', 'adopted', 'device', 'app', 'unb=123')
+        self.store.observe('a', value)
+        self.store.approve('a', value)
+        self.store.observe('a', BrowserToken('123', 'pending', 'device', 'app', 'unb=123'))
+        context = SimpleNamespace(on=lambda *args: None, remove_listener=lambda *args: None)
+        @asynccontextmanager
+        async def connect():
+            yield context
+        self.listener.browser = SimpleNamespace(connect=connect)
+        await self.listener.start()
+        await self.listener.close()
+        self.assertIs(self.store.get('a'), value)
+        self.assertIs(self.store.get('a', candidate=True), value)
+
     async def test_observes_response_with_its_original_request_parameters(self):
         await self.listener.consume(self.response)
         value = self.store.get('a', candidate=True)

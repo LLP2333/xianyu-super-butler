@@ -99,6 +99,24 @@ class TokenListener:
         self.pending.add(task)
         task.add_done_callback(self.pending.discard)
 
+    async def close_goofish_pages(self):
+        """End website messaging without closing Chrome or clearing its profile."""
+        if self.context is None:
+            raise RuntimeError('浏览器监听已断开，无法确认闲鱼标签页已关闭')
+        def is_goofish(page):
+            host = urlsplit(page.url).hostname or ''
+            return host == 'goofish.com' or host.endswith('.goofish.com')
+
+        pages = list(self.context.pages)
+        targets = [page for page in pages if is_goofish(page)]
+        # Keep Chrome alive even when every existing tab belongs to Goofish.
+        if targets and len(targets) == len(pages):
+            await self.context.new_page()
+        for page in targets:
+            await page.close(run_before_unload=False)
+        if any(is_goofish(page) for page in self.context.pages):
+            raise RuntimeError('闲鱼标签页未全部关闭，账号保持暂停')
+
     async def current_account(self):
         if not self.context or not self.task or self.task.done():
             raise ValueError('网页 Token 监听未连接，请重新打开浏览器入口')
@@ -124,7 +142,7 @@ class TokenListener:
             self.error = '网页 Token 监听已断开，请重新打开浏览器入口'
         finally:
             self.ready.set()
-            tokens.clear(self.account_id)
+            tokens.discard_unadopted(self.account_id)
             if self.context:
                 self.context.remove_listener('response', self.on_response)
             for task in self.pending:

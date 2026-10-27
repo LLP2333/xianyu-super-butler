@@ -45,6 +45,27 @@ class AccountBrowserService:
         configured = self.db.get_system_setting('browser_desktop_url') or ''
         return validate_desktop_address(configured) or browser.desktop.desktop_url
 
+    def browser_stopped(self):
+        return self.db.get_system_setting('account_browser_stopped') == 'true'
+
+    def set_browser_stopped(self, stopped):
+        if not self.db.set_system_setting('account_browser_stopped', 'true' if stopped else 'false'):
+            raise RuntimeError('浏览器启停状态保存失败')
+
+    async def stop_browser(self, user_id):
+        async with self.browsers.lock(PRIMARY):
+            records = self.db.get_all_cookies()
+            if records:
+                self.account(next(iter(records)), user_id)
+            elif self.pending_owner != user_id:
+                raise LookupError('没有属于当前用户的浏览器')
+            existing = self.browsers.browsers.get(PRIMARY)
+            if existing and existing.owner_id != user_id:
+                raise LookupError('无权停止其他用户的浏览器')
+            self.set_browser_stopped(True)
+            await self.stop()
+            return {**self.listener_status(), 'message': '浏览器已停止，登录数据和已采用的 Token 已保留，管家消息任务继续运行。'}
+
     async def stop(self):
         if self.listener:
             await self.listener.close()
@@ -75,6 +96,7 @@ class AccountBrowserService:
             self.pending_owner = user_id
             self.created_id = None
             self.setup_error = None
+            self.set_browser_stopped(False)
             browser = await self.ensure(user_id)
             return {'message': '请在原生浏览器登录闲鱼并打开消息页，系统会自动捕获 Cookie 和消息 Token 并添加账号。',
                     'desktop_url': self.desktop_url(user_id)}
@@ -123,6 +145,7 @@ class AccountBrowserService:
                     if not self.db.update_cookie_account_info(account_id, cookie_value=value.cookies):
                         raise RuntimeError('登录状态保存失败，账号仍保持暂停')
                 tokens.approve(account_id, value)
+                await listener.close_goofish_pages()
                 risk_control.registry.get(account_id).reset(verified=True)
                 await manager.resume_cookie_task(account_id, value.cookies)
                 self.manual.discard(account_id)
@@ -146,22 +169,33 @@ class AccountBrowserService:
         guard = risk_control.registry.get(account_id)
         active = bool(value and not cookie_expired(value.cookies) and not guard.verification_required and account_id not in self.manual)
         error = self.errors.get(account_id) or self.setup_error
-        state = 'error' if error else 'active' if active else 'captured' if candidate else 'waiting'
+        manager = self.account_manager()
+        instance = manager.instances.get(account_id) if manager else None
+        connection = getattr(instance, 'connection_state', None)
+        ws = getattr(instance, 'ws', None)
+        connected = bool(active and getattr(connection, 'value', connection) == 'connected'
+                         and ws is not None and not ws.closed
+                         and getattr(instance, 'current_token', None) == value.token)
+        state = 'error' if error else 'active' if connected else 'connecting' if active else 'captured' if candidate else 'waiting'
         return {'credentials_state': state, 'captured': bool(candidate),
                 'captured_at': candidate.received_at if candidate else None,
-                'message': error or ('Cookie 已保存、消息 Token 已采用，账号任务已恢复' if active else
+                'message': error or ('消息认证成功，管家已连接' if connected else
+                           '凭据已保存，闲鱼标签页已关闭，管家正在连接并验证消息服务' if active else
                            guard.last_hit_reason or '等待你在闲鱼网页登录并打开消息页')}
 
     def listener_status(self):
         listener = self.listener
         running = bool(listener and listener.task and not listener.task.done())
         connected = bool(running and listener.ready.is_set() and listener.context is not None)
-        return {'listening': connected,
+        browser = self.browsers.browsers.get(PRIMARY)
+        return {'browser_running': bool(browser and browser.alive), 'listening': connected,
                 'listener_state': 'listening' if connected else 'connecting' if running and not listener.ready.is_set() else 'disconnected',
                 'listener_error': listener.error if listener else None}
 
     async def reconnect(self, user_id):
         async with self.browsers.lock(PRIMARY):
+            if self.browser_stopped():
+                raise ValueError('浏览器已停止，请先启动浏览器')
             self.desktop(user_id)
             records = self.db.get_all_cookies()
             account_id = next(iter(records), None)
@@ -180,10 +214,13 @@ class AccountBrowserService:
                     'desktop_url': self.desktop_url(user_id)}
 
     async def setup_status(self, user_id):
-        self.desktop(user_id)
+        if self.created_id:
+            self.account(self.created_id, user_id)
+        elif self.pending_owner != user_id:
+            raise LookupError('没有待添加的账号')
         key = self.created_id or PENDING
         return {**self.listener_status(), **self.credential_status(key), 'account_id': self.created_id,
-                'desktop_url': self.desktop_url(user_id)}
+                'desktop_url': None if self.browser_stopped() else self.desktop_url(user_id)}
 
     async def takeover(self, account_id, user_id, restart=False):
         async with self.browsers.lock(PRIMARY):
@@ -195,13 +232,15 @@ class AccountBrowserService:
                 await self.pause_account(account_id)
             if restart:
                 await self.stop()
+            self.set_browser_stopped(False)
             await self.ensure(user_id, account_id, record['value'])
             return {**self.listener_status(), **self.credential_status(account_id),
                     'desktop_url': self.desktop_url(user_id)}
 
     async def status(self, account_id, user_id):
         self.account(account_id, user_id)
-        return {**self.listener_status(), **self.credential_status(account_id)}
+        return {**self.listener_status(), **self.credential_status(account_id),
+                'desktop_url': self.desktop_url(user_id) if self.listener_status()['browser_running'] else None}
 
     async def clear(self, user_id):
         async with self.browsers.lock(PRIMARY):
@@ -228,6 +267,7 @@ class AccountBrowserService:
             if existing and existing.owner_id != user_id:
                 raise LookupError('无权清空其他管理员的浏览器')
             await self.stop()
+            self.set_browser_stopped(False)
             await self.browsers.pool.clear_profile(user_id)
             self.created_id = None
             self.setup_error = None
@@ -247,7 +287,7 @@ class AccountBrowserService:
                 await self.stop()
                 return
             if not records:
-                if self.pending_owner is not None:
+                if self.pending_owner is not None and not self.browser_stopped():
                     await self.ensure(self.pending_owner)
                 elif self.listener:
                     await self.stop()
@@ -262,6 +302,10 @@ class AccountBrowserService:
                 value = tokens.get(account_id)
                 if not value or cookie_expired(value.cookies) or risk_control.registry.get(account_id).verification_required:
                     await self.pause_account(account_id)
+                if self.browser_stopped():
+                    if self.listener or self.browsers.browsers.get(PRIMARY):
+                        await self.stop()
+                    return
                 await self.ensure(record['user_id'], account_id, record['value'])
 
     async def run(self):

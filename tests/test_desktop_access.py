@@ -50,6 +50,20 @@ class DesktopAccessTests(unittest.TestCase):
         check=self.client.get('/api/account-browser/desktop-auth',headers={'x-desktop-key':'internal-key','x-desktop-session':session})
         self.assertEqual(check.status_code,403)
 
+    def test_stop_revokes_desktop_session_and_unused_links(self):
+        self.service.stop_browser = AsyncMock(return_value={'message': 'stopped'})
+        response = self.enter(self.grant())
+        cookie = SimpleCookie(); cookie.load(response.headers['set-cookie'])
+        session = cookie['xianyu_desktop'].value
+        unused = self.grant()
+        self.assertEqual(self.client.post('/api/account-browser/stop').status_code, 200)
+        self.service.stop_browser.assert_awaited_once_with(7)
+        # Even after the same container starts again, old grants remain revoked.
+        self.assertEqual(self.enter(unused).status_code, 403)
+        self.assertEqual(self.client.get('/api/account-browser/desktop-auth', headers={
+            'x-desktop-key': 'internal-key', 'x-desktop-session': session}).status_code, 403)
+        self.assertEqual(self.enter(self.grant()).status_code, 303)
+
     def test_custom_origin_link_keeps_ticket_authorization(self):
         self.browser.desktop.desktop_url = 'https://browser.example.com/'
         response = self.client.post('/api/account-browser/desktop-link', headers={'authorization':'Bearer app-session'})

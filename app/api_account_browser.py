@@ -98,6 +98,17 @@ def create_account_browser_router(require_operator, service, verify_session):
         check_entry(sessions.get(request.headers.get('x-desktop-session', '')), browser)
         return Response(status_code=204, headers={'Cache-Control': 'no-store'})
 
+    @router.post('/stop')
+    async def stop_browser(user=Depends(require_operator)):
+        async def operation():
+            result = await service.stop_browser(user['user_id'])
+            for entries in (tickets, sessions):
+                for key, entry in list(entries.items()):
+                    if entry[0] == user['user_id']:
+                        entries.pop(key, None)
+            return result
+        return await call(operation())
+
     @router.post('/clear')
     async def clear(body: ClearBrowserIn, user=Depends(require_operator)):
         if not body.confirmed:

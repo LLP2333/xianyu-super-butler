@@ -60,6 +60,15 @@ class TokenStore:
                 if values.get(account_id) and values[account_id].token == token:
                     values.pop(account_id, None)
 
+    def discard_unadopted(self, account_id):
+        """Listener lifetime does not own credentials already handed to the account."""
+        with self._lock:
+            active = self._active.get(account_id)
+            if active:
+                self._candidates[account_id] = active
+            else:
+                self._candidates.pop(account_id, None)
+
     def clear(self, account_id):
         with self._lock:
             self._candidates.pop(account_id, None)

@@ -314,9 +314,9 @@ export const getRiskControlStatus = async (): Promise<{
   return get('/api/risk-control/status');
 };
 
-export type BrowserCredentialStatus = { credentials_state: 'waiting' | 'captured' | 'active' | 'error'; captured: boolean; captured_at?: number; message: string };
-export type BrowserStatus = BrowserListenerStatus & BrowserCredentialStatus & { account_id?: string };
-export type BrowserListenerStatus = { listening: boolean; listener_state: 'connecting' | 'listening' | 'disconnected'; listener_error?: string };
+export type BrowserCredentialStatus = { credentials_state: 'waiting' | 'captured' | 'connecting' | 'active' | 'error'; captured: boolean; captured_at?: number; message: string };
+export type BrowserStatus = BrowserListenerStatus & BrowserCredentialStatus & { account_id?: string; desktop_url?: string };
+export type BrowserListenerStatus = { browser_running: boolean; listening: boolean; listener_state: 'connecting' | 'listening' | 'disconnected'; listener_error?: string };
 export const reconnectBrowserListener = (): Promise<BrowserDesktop & BrowserListenerStatus> => post('/api/account-browser/reconnect', {}, { timeout: 120000 });
 export type BrowserDesktop = { message: string; desktop_url?: string; open_url?: string };
 
@@ -1372,3 +1372,5 @@ export const createQuoteBook = async (file: File): Promise<{
 
 export const deleteQuoteBook = async (bookId: number): Promise<{ success: boolean }> =>
   del(`/api/logistics/quote-books/${bookId}`);
+
+export const stopAccountBrowser = (): Promise<BrowserDesktop> => post('/api/account-browser/stop', {}, { timeout: 120000 });
