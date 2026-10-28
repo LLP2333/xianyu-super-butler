@@ -382,6 +382,49 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.fetch_credentials('123', 7)
         self.assertNotIn('123', self.service.errors)
 
+    def adopt_aged(self, age):
+        value = BrowserToken('123', f'old-{age}', 'device', 'app', 'unb=123; cookie2=x', __import__('time').time() - age)
+        self.store.observe('123', value); self.store.approve('123', value)
+        return value
+
+    async def test_renewal_due_before_expiry_but_not_for_platform_risk(self):
+        self.adopt_aged(60)
+        self.assertFalse(self.service.renewal_due('123'))
+        self.adopt_aged(3600 - 300)
+        self.assertTrue(self.service.renewal_due('123'))
+        risk_control.registry.get('123').require_verification('闲鱼要求验证')
+        self.assertFalse(self.service.renewal_due('123'))
+
+    async def test_renew_adopts_new_token_without_notification(self):
+        old = self.adopt_aged(3500)
+        async def open_messages():
+            await self.service.capture_credentials(self.capture())
+        def listener(key, expected, browser, callback):
+            return SimpleNamespace(account_id=key, expected_account=expected, browser=browser,
+                current_account=AsyncMock(return_value='123'), start=AsyncMock(), close=AsyncMock(),
+                close_goofish_pages=AsyncMock(), open_messages=AsyncMock(side_effect=lambda: asyncio.create_task(open_messages())),
+                context=object(), task=SimpleNamespace(done=lambda: False), ready=SimpleNamespace(is_set=lambda: True), error=None)
+        with patch('app.services.account_browser.TokenListener', side_effect=listener), \
+                patch('app.services.account_browser.schedule_manual_verification_notification') as notify:
+            await self.service.renew('123', 7)
+        self.assertIsNot(self.store.active('123'), old)
+        self.assertFalse(risk_control.registry.get('123').verification_required)
+        self.assertEqual(self.service.renew_failures, 0)
+        notify.assert_not_called()
+
+    async def test_repeated_renewal_failure_notifies_once_as_expiry(self):
+        self.adopt_aged(3500)
+        with patch('app.services.account_browser.RENEW_WAIT', 0), \
+                patch('app.services.account_browser.schedule_manual_verification_notification') as notify:
+            for _ in range(3):
+                await self.service.renew('123', 7)
+        guard = risk_control.registry.get('123')
+        self.assertEqual(guard.verification_kind, 'expired')
+        self.assertIn('自动续期失败', guard.last_hit_reason)
+        self.assertEqual(self.service.renew_failures, 3)
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.args[2], '凭据到期 · 自动续期失败')
+
     async def test_fetch_rejects_wrong_owner_disabled_and_duplicate(self):
         with self.assertRaises(LookupError):
             await self.service.fetch_credentials('123', 8)

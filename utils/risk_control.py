@@ -10,6 +10,8 @@
   冷却时间按连续命中次数指数增长。
 - **限流**：令牌桶控制每个账号的请求速率，多账号并发时也不会突发。
 - **人工验证**：平台明确要求验证时持续拦截主动请求，只有 Token 确认后解除。
+- **凭据到期**：本地 Token 到期或平台提示登录过期时同样拦截请求，但这不是
+  风控，由原生浏览器自动续期，不发人工验证通知。
 
 限流、冷却和人工验证等待均为进程内状态；重启后重新校验凭证。
 """
@@ -37,6 +39,12 @@ RISK_CONTROL_MARKERS = (
 # 「容器仍存在」误判成验证失败，冷却动辄按小时计，账号被白白锁住。
 COOLDOWN_STEPS = (60, 180, 300, 600, 1200)
 
+# 等待新凭据的原因。只有 risk 是平台真正要求人工验证；
+# expired 是凭据到期，renewing 是浏览器正在获取新凭据，两者都可自动恢复。
+VERIFICATION_RISK = 'risk'
+VERIFICATION_EXPIRED = 'expired'
+VERIFICATION_RENEWING = 'renewing'
+
 
 def is_risk_control_error(message) -> bool:
     """判断一段错误文本是否来自平台风控或限流。"""
@@ -53,6 +61,7 @@ class AccountGuard:
 
         # 熔断
         self.verification_required = False
+        self.verification_kind = ''
         self.blocked_until = 0.0
         self.consecutive_hits = 0
         self.last_hit_reason = ""
@@ -85,13 +94,21 @@ class AccountGuard:
         )
         return cooldown
 
-    def require_verification(self, reason: str) -> None:
-        newly_required = not self.verification_required
+    def require_verification(self, reason: str, kind: str = VERIFICATION_RISK) -> None:
+        # 平台要求的验证只能由新凭据解除，不能被随后的到期或续期覆盖成可自动恢复。
+        if self.verification_required and self.verification_kind == VERIFICATION_RISK and kind != VERIFICATION_RISK:
+            return
+        newly_risk = kind == VERIFICATION_RISK and not (
+            self.verification_required and self.verification_kind == VERIFICATION_RISK)
         self.verification_required = True
+        self.verification_kind = kind
         self.blocked_until = 0.0
         self.last_hit_reason = reason
-        logger.warning(f'【{self.cookie_id}】等待人工验证，停止自动重试')
-        if newly_required:
+        if kind == VERIFICATION_RISK:
+            logger.warning(f'【{self.cookie_id}】等待人工验证，停止自动重试')
+        else:
+            logger.info(f'【{self.cookie_id}】等待新凭据（{kind}），暂停闲鱼请求: {reason}')
+        if newly_risk:
             from app.services.risk_notifications import schedule_manual_verification_notification
             schedule_manual_verification_notification(self.cookie_id, reason)
 
@@ -100,6 +117,7 @@ class AccountGuard:
         if self.verification_required and not verified:
             return
         self.verification_required = False
+        self.verification_kind = ''
         if self.consecutive_hits or self.blocked_until:
             logger.info(f"【{self.cookie_id}】风控状态已解除")
         self.consecutive_hits = 0
@@ -130,6 +148,7 @@ class AccountGuard:
             "cookie_id": self.cookie_id,
             "blocked": self.is_blocked,
             "verification_required": self.verification_required,
+            "verification_kind": self.verification_kind,
             "remaining_seconds": self.remaining_seconds,
             "consecutive_hits": self.consecutive_hits,
             "reason": self.last_hit_reason,

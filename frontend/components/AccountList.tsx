@@ -31,7 +31,7 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
     blocked: boolean;
     remaining_seconds: number;
     verification_required?: boolean;
-    verification_type: 'none' | 'slider' | 'face' | 'qr' | 'risk_control';
+    verification_type: 'none' | 'slider' | 'face' | 'qr' | 'risk_control' | 'expired' | 'renewing';
     verification_message: string;
     verification_url?: string;
   }>>([]);
@@ -405,7 +405,9 @@ const AccountList: React.FC<{ isAdmin: boolean }> = ({ isAdmin }) => {
                   <p className="mt-1 text-xs font-medium text-gray-400">备注：{account.remark}</p>
                 )}
                 <div className="flex flex-wrap gap-2">
-                   {blockedState && <span className="status-badge bg-red-100 text-red-700">{blockedState.verification_type === 'slider' ? '滑块验证' : blockedState.verification_type === 'face' ? '人脸验证' : '平台风控'}{blockedState.verification_required ? ' · 等待人工' : blockedState.blocked ? ` · ${Math.max(1, Math.ceil(blockedState.remaining_seconds / 60))} 分钟` : ''}</span>}
+                   {blockedState && (blockedState.verification_type === 'expired' || blockedState.verification_type === 'renewing'
+                     ? <span className="status-badge bg-amber-100 text-amber-800" title={blockedState.verification_message}>{blockedState.verification_type === 'renewing' ? '正在续期凭据' : '凭据到期 · 等待续期'}</span>
+                     : <span className="status-badge bg-red-100 text-red-700">{blockedState.verification_type === 'slider' ? '滑块验证' : blockedState.verification_type === 'face' ? '人脸验证' : '平台风控'}{blockedState.verification_required ? ' · 等待人工' : blockedState.blocked ? ` · ${Math.max(1, Math.ceil(blockedState.remaining_seconds / 60))} 分钟` : ''}</span>)}
                    {account.auto_confirm && <span className="status-badge status-badge-warning flex items-center gap-1.5"><MessageSquare className="w-3 h-3"/> 自动确认</span>}
                    {account.pause_duration > 0 && <span className="status-badge status-badge-info flex items-center gap-1.5"><Clock className="w-3 h-3"/> 暂停 {account.pause_duration} 分钟</span>}
                 </div>

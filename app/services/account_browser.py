@@ -1,15 +1,28 @@
-"""One native browser: onboarding, passive credentials, resume and explicit reset."""
+"""One native browser: onboarding, passive credentials, resume, renewal and explicit reset."""
 import asyncio
+import time
 from loguru import logger
+from app.config import TOKEN_REFRESH_INTERVAL
+from app.services.risk_notifications import (RENEWAL_HINT, RENEWAL_TITLE,
+                                             schedule_manual_verification_notification)
 from utils.account_browser.manager import BrowserManager
 from utils.account_browser.listener import TokenListener
-from utils.account_browser.tokens import tokens
+from utils.account_browser.tokens import TOKEN_MAX_AGE, tokens
 from utils.account_browser.credentials import cookie_expired, invalidate_credentials, WAITING
 from utils.xianyu_utils import trans_cookies
 from utils import risk_control
 
 PRIMARY = 'primary'
 PENDING = 'browser-onboarding'
+
+# 消息 Token 到期前多久由浏览器自动续期（秒）
+RENEW_BEFORE = 600
+# 自动续期失败后的重试间隔（秒）
+RENEW_RETRY = 300
+# 打开消息页后等待捕获新 Token 的时长（秒）
+RENEW_WAIT = 90
+# 连续失败几次后通知用户
+RENEW_NOTIFY_AFTER = 2
 
 
 class AccountBrowserService:
@@ -25,6 +38,9 @@ class AccountBrowserService:
         self.errors = {}
         self.task = None
         self.opening_messages = set()
+        self.renew_task = None
+        self.renew_failures = 0
+        self.next_renew_at = 0.0
 
     def account(self, account_id, user_id):
         record = self.db.get_cookie_details(account_id)
@@ -102,8 +118,8 @@ class AccountBrowserService:
             return {'message': '请在原生浏览器登录闲鱼并打开消息页，系统会自动捕获 Cookie 和消息 Token 并添加账号。',
                     'desktop_url': self.desktop_url(user_id)}
 
-    async def pause_account(self, account_id, reason=WAITING, force=False):
-        invalidate_credentials(account_id, reason)
+    async def pause_account(self, account_id, reason=WAITING, force=False, kind=risk_control.VERIFICATION_EXPIRED):
+        invalidate_credentials(account_id, reason, kind=kind)
         manager = self.account_manager()
         if manager is None:
             raise RuntimeError('账号管理尚未就绪')
@@ -142,7 +158,8 @@ class AccountBrowserService:
                         raise ValueError('网页账号与已有账号不匹配，未保存')
                     if tokens.get(account_id) is value and not risk_control.registry.get(account_id).verification_required:
                         return
-                    await self.pause_account(account_id, '已捕获新凭据，正在保存并恢复')
+                    await self.pause_account(account_id, '已捕获新凭据，正在保存并恢复',
+                                             kind=risk_control.VERIFICATION_RENEWING)
                     if not self.db.update_cookie_account_info(account_id, cookie_value=value.cookies):
                         raise RuntimeError('登录状态保存失败，账号仍保持暂停')
                 tokens.approve(account_id, value)
@@ -152,6 +169,8 @@ class AccountBrowserService:
                 self.manual.discard(account_id)
                 self.errors.pop(account_id, None)
                 self.setup_error = None
+                self.renew_failures = 0
+                self.next_renew_at = 0.0
             except asyncio.CancelledError:
                 if account_id != PENDING:
                     await self.pause_account(account_id, '凭据采用被中断，等待网页重新获取', force=True)
@@ -250,7 +269,8 @@ class AccountBrowserService:
                 record = self.account(account_id, user_id)
                 if not self.db.get_cookie_status(account_id):
                     raise ValueError('请先启用账号')
-                await self.pause_account(account_id, '正在打开闲鱼首页并点击消息，等待网页提供凭据', force=True)
+                await self.pause_account(account_id, '正在打开闲鱼首页并点击消息，等待网页提供凭据', force=True,
+                                         kind=risk_control.VERIFICATION_RENEWING)
                 self.errors.pop(account_id, None)
                 self.set_browser_stopped(False)
                 try:
@@ -260,6 +280,7 @@ class AccountBrowserService:
                     raise
                 except Exception:
                     self.errors[account_id] = '未能进入闲鱼消息页，请打开原生 Chrome 桌面检查登录或验证；页面已保留'
+                    invalidate_credentials(account_id, self.errors[account_id])
                 return {**self.listener_status(), **self.credential_status(account_id),
                         'desktop_url': self.desktop_url(user_id) if self.listener_status()['browser_running'] else None}
         finally:
@@ -328,7 +349,11 @@ class AccountBrowserService:
             record = self.db.get_cookie_details(account_id)
             if record:
                 value = tokens.get(account_id)
-                if not value or cookie_expired(value.cookies) or risk_control.registry.get(account_id).verification_required:
+                guard = risk_control.registry.get(account_id)
+                if guard.verification_required:
+                    # Keep the current reason, e.g. a renewal in progress, instead of the generic wait.
+                    await self.pause_account(account_id, guard.last_hit_reason, kind=guard.verification_kind)
+                elif not value or cookie_expired(value.cookies):
                     await self.pause_account(account_id)
                 if self.browser_stopped():
                     if self.listener or self.browsers.browsers.get(PRIMARY):
@@ -336,11 +361,74 @@ class AccountBrowserService:
                     return
                 await self.ensure(record['user_id'], account_id, record['value'])
 
+    def renewal_due(self, account_id):
+        guard = risk_control.registry.get(account_id)
+        # 平台要求的验证需要人处理，自动刷新消息页只会打断正在进行的验证。
+        if guard.verification_required and guard.verification_kind == risk_control.VERIFICATION_RISK:
+            return False
+        value = tokens.active(account_id)
+        if not value or cookie_expired(value.cookies) or guard.verification_required:
+            return True
+        lifetime = min(TOKEN_REFRESH_INTERVAL, TOKEN_MAX_AGE)
+        return time.time() - value.received_at >= lifetime - RENEW_BEFORE
+
+    def schedule_renewal(self):
+        if self.renew_task and not self.renew_task.done():
+            return
+        if time.monotonic() < self.next_renew_at:
+            return
+        records = self.db.get_all_cookies()
+        if len(records) != 1:
+            return
+        account_id = next(iter(records))
+        if account_id in self.opening_messages or not self.db.get_cookie_status(account_id):
+            return
+        record = self.db.get_cookie_details(account_id)
+        if not record or not self.renewal_due(account_id):
+            return
+        self.renew_task = asyncio.create_task(self.renew(account_id, record['user_id']), name='account-browser-renew')
+
+    async def renew(self, account_id, user_id):
+        """Do what the "获取新凭据" button does, before the Token expires."""
+        before = tokens.active(account_id)
+        logger.info(f'【{account_id}】消息 Token 即将到期或已到期，原生浏览器自动续期')
+        error = None
+        try:
+            await self.fetch_credentials(account_id, user_id)
+            deadline = time.monotonic() + RENEW_WAIT
+            while True:
+                error = self.errors.get(account_id)
+                value = tokens.active(account_id)
+                if error or (value is not None and value is not before
+                             and not risk_control.registry.get(account_id).verification_required):
+                    break
+                if time.monotonic() >= deadline:
+                    error = '已打开闲鱼消息页，但未捕获到新的消息 Token'
+                    break
+                await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            error = str(exc) if isinstance(exc, (LookupError, RuntimeError, ValueError)) else '自动续期异常'
+        if error is None:
+            self.renew_failures = 0
+            self.next_renew_at = 0.0
+            logger.info(f'【{account_id}】消息 Token 自动续期成功')
+            return
+        self.renew_failures += 1
+        self.next_renew_at = time.monotonic() + RENEW_RETRY
+        reason = f'自动续期失败：{error}'
+        invalidate_credentials(account_id, reason)
+        logger.warning(f'【{account_id}】{reason}（连续第 {self.renew_failures} 次），{RENEW_RETRY} 秒后重试')
+        if self.renew_failures == RENEW_NOTIFY_AFTER:
+            schedule_manual_verification_notification(account_id, error, RENEWAL_TITLE, RENEWAL_HINT)
+
     async def run(self):
         failures = 0
         while True:
             try:
                 await self.reconcile()
+                self.schedule_renewal()
                 failures = 0
             except Exception as exc:
                 failures += 1
@@ -351,9 +439,10 @@ class AccountBrowserService:
         self.task = asyncio.create_task(self.run(), name='account-browser')
 
     async def close(self):
-        if self.task:
-            self.task.cancel()
-            await asyncio.gather(self.task, return_exceptions=True)
+        for task in (self.task, self.renew_task):
+            if task:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
         if self.listener:
             await self.listener.close()
         await self.browsers.close()

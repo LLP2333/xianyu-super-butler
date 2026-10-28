@@ -304,7 +304,8 @@ export const getRiskControlStatus = async (): Promise<{
     remaining_seconds: number;
     consecutive_hits: number;
     reason: string;
-    verification_type: 'none' | 'slider' | 'face' | 'qr' | 'risk_control';
+    verification_type: 'none' | 'slider' | 'face' | 'qr' | 'risk_control' | 'expired' | 'renewing';
+    verification_kind?: '' | 'risk' | 'expired' | 'renewing';
     verification_message: string;
     verification_url?: string;
     latest_event: string;

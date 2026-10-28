@@ -2034,7 +2034,7 @@ class XianyuLive:
         if not value or value.account != self.myid:
             self.current_token = None
             self.last_token_refresh_status = 'waiting_browser_token'
-            invalidate_credentials(self.cookie_id, '凭据已失效，等待原生浏览器提供新凭据')
+            invalidate_credentials(self.cookie_id, '消息 Token 已到期，等待原生浏览器自动续期')
             return None
         try:
             require_credentials(self.cookie_id)
@@ -5779,7 +5779,7 @@ class XianyuLive:
                 if str((response.get('headers') or {}).get('mid', '')) == str(registration_mid):
                     if str(response.get('code')) != '200':
                         from utils.account_browser.tokens import tokens
-                        invalidate_credentials(self.cookie_id, '消息服务拒绝当前 Token，请在原生网页重新登录或刷新消息页', tokens.get(self.cookie_id))
+                        invalidate_credentials(self.cookie_id, '消息服务拒绝当前 Token，等待原生浏览器自动续期', tokens.get(self.cookie_id))
                         self.current_token = None
                         raise RuntimeError('消息服务拒绝网页 Token，请在原生网页刷新后重试')
                     break

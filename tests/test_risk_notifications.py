@@ -49,7 +49,7 @@ class RiskNotificationTests(unittest.IsolatedAsyncioTestCase):
             registry.get.return_value = guard
             with patch('utils.account_browser.credentials.tokens', TokenStore()):
                 async def account_task():
-                    invalidate_credentials('account', '平台要求人工验证')
+                    invalidate_credentials('account', '平台要求人工验证', kind='risk')
                     asyncio.current_task().cancel()
                     await asyncio.sleep(0)
                 task = asyncio.create_task(account_task())
@@ -69,6 +69,32 @@ class RiskNotificationTests(unittest.IsolatedAsyncioTestCase):
         await self.drain()
         self.assertTrue(guard.verification_required)
         self.assertEqual(self.sender.await_count, 2)
+
+    async def test_expiry_and_renewal_do_not_send_risk_notification(self):
+        guard = AccountGuard('account')
+        guard.require_verification('消息 Token 已到期', 'expired')
+        guard.require_verification('正在打开消息页', 'renewing')
+        await self.drain()
+        self.sender.assert_not_awaited()
+        guard.require_verification('闲鱼要求验证')
+        await self.drain()
+        self.sender.assert_awaited_once()
+
+    async def test_risk_is_not_downgraded_by_later_expiry(self):
+        guard = AccountGuard('account')
+        guard.require_verification('闲鱼要求验证')
+        guard.require_verification('消息 Token 已到期', 'expired')
+        self.assertEqual(guard.verification_kind, 'risk')
+        self.assertEqual(guard.last_hit_reason, '闲鱼要求验证')
+
+    async def test_renewal_failure_notification_uses_its_own_title(self):
+        risk_notifications.schedule_manual_verification_notification(
+            'account', '未捕获到新的消息 Token',
+            risk_notifications.RENEWAL_TITLE, risk_notifications.RENEWAL_HINT)
+        await self.drain()
+        text = self.sender.call_args.args[2]
+        self.assertTrue(text.startswith('凭据到期 · 自动续期失败'))
+        self.assertNotIn('平台风控', text)
 
     async def test_unsubscribed_account_sends_nothing(self):
         self.db.get_account_notifications.return_value = []

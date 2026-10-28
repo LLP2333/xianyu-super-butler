@@ -67,6 +67,16 @@ class CredentialGateTests(unittest.IsolatedAsyncioTestCase):
         await self.call()
         self.assertEqual(self.calls,2)
 
+    async def test_expiry_and_validation_are_classified_separately(self):
+        self.adopt()
+        self.payload={'ret':['FAIL_SYS_TOKEN_EXOIRED::令牌过期']}
+        with self.assertRaises(risk_control.RiskControlBlocked): await self.call()
+        self.assertEqual(risk_control.registry.get('acc').verification_kind,'expired')
+        self.adopt('fresh')
+        self.payload={'ret':['FAIL_SYS_USER_VALIDATE'],'data':{'url':'https://example/punish?x5'}}
+        with self.assertRaises(risk_control.RiskControlBlocked): await self.call()
+        self.assertEqual(risk_control.registry.get('acc').verification_kind,'risk')
+
     async def test_seller_expiry_no_retry_and_other_api_is_blocked(self):
         self.adopt()
         self.payload={'ret':['FAIL_SYS_TOKEN_EXOIRED::令牌过期']}

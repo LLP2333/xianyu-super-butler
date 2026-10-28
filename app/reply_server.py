@@ -8254,6 +8254,18 @@ def get_risk_control_status(current_user: Dict[str, Any] = Depends(get_current_u
             })
             continue
 
+        # 凭据到期或续期中不是风控，不能拿历史风控日志去归类。
+        if state.get('verification_kind') in (risk_control.VERIFICATION_EXPIRED, risk_control.VERIFICATION_RENEWING):
+            accounts.append({
+                **state,
+                'verification_type': state['verification_kind'],
+                'verification_message': state.get('reason') or '',
+                'verification_url': '',
+                'latest_event': '',
+                'latest_event_at': None,
+            })
+            continue
+
         recent_logs = db_manager.get_risk_control_logs(
             cookie_id=cid, limit=1, user_id=current_user['user_id']
         )

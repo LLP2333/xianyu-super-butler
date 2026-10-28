@@ -3,6 +3,9 @@ from dataclasses import dataclass, field, replace
 from threading import RLock
 import time
 
+# 网页签发的消息 Token 在本地的有效期（秒），从首次捕获起算。
+TOKEN_MAX_AGE = 3600
+
 
 @dataclass(frozen=True)
 class BrowserToken:
@@ -36,12 +39,17 @@ class TokenStore:
                 return
             self._candidates[account_id] = value
 
-    def get(self, account_id, *, candidate=False, max_age=3600):
+    def get(self, account_id, *, candidate=False, max_age=TOKEN_MAX_AGE):
         with self._lock:
             value = (self._candidates if candidate else self._active).get(account_id)
             if value and 0 <= time.time() - value.received_at < max_age:
                 return value
             return None
+
+    def active(self, account_id):
+        """The adopted Token regardless of age, for scheduling its renewal."""
+        with self._lock:
+            return self._active.get(account_id)
 
     def approve(self, account_id, value):
         with self._lock:
