@@ -882,11 +882,17 @@ class DBManager:
                 processing_result TEXT,
                 processing_status TEXT DEFAULT 'processing',
                 error_message TEXT,
+                screenshot TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
             )
             ''')
+            # 兼容旧库：续期失败截图的文件名（文件在不对外开放的 logs/renewal/）。
+            try:
+                self._execute_sql(cursor, "SELECT screenshot FROM risk_control_logs LIMIT 1")
+            except sqlite3.OperationalError:
+                self._execute_sql(cursor, "ALTER TABLE risk_control_logs ADD COLUMN screenshot TEXT")
 
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS message_filters (
@@ -7749,7 +7755,8 @@ class DBManager:
 
     def add_risk_control_log(self, cookie_id: str, event_type: str = 'slider_captcha',
                            event_description: str = None, processing_result: str = None,
-                           processing_status: str = 'processing', error_message: str = None) -> bool:
+                           processing_status: str = 'processing', error_message: str = None,
+                           screenshot: str = None) -> bool:
         """
         添加风控日志记录
 
@@ -7760,6 +7767,7 @@ class DBManager:
             processing_result: 处理结果
             processing_status: 处理状态 ('processing', 'success', 'failed')
             error_message: 错误信息
+            screenshot: 截图文件名
 
         Returns:
             bool: 添加成功返回True，失败返回False
@@ -7769,9 +7777,9 @@ class DBManager:
                 cursor = self.conn.cursor()
                 cursor.execute('''
                     INSERT INTO risk_control_logs
-                    (cookie_id, event_type, event_description, processing_result, processing_status, error_message)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (cookie_id, event_type, event_description, processing_result, processing_status, error_message))
+                    (cookie_id, event_type, event_description, processing_result, processing_status, error_message, screenshot)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (cookie_id, event_type, event_description, processing_result, processing_status, error_message, screenshot))
                 self.conn.commit()
                 return True
         except Exception as e:
@@ -7883,6 +7891,29 @@ class DBManager:
         except Exception as e:
             logger.error(f"获取风控日志失败: {e}")
             return []
+
+    def get_risk_control_log(self, log_id: int, user_id: int = None) -> Optional[Dict]:
+        """获取单条风控日志；传入 user_id 时只返回该用户账号的记录。"""
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                sql = '''
+                    SELECT r.* FROM risk_control_logs r
+                    JOIN cookies c ON r.cookie_id = c.id
+                    WHERE r.id = ?
+                '''
+                params = [log_id]
+                if user_id is not None:
+                    sql += ' AND c.user_id = ?'
+                    params.append(user_id)
+                cursor.execute(sql, params)
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return dict(zip([description[0] for description in cursor.description], row))
+        except Exception as e:
+            logger.error(f"获取风控日志失败: {e}")
+            return None
 
     def get_risk_control_logs_count(
         self,

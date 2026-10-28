@@ -327,6 +327,7 @@ app = FastAPI(
 
 from app.api_account_browser import create_account_browser_router
 from app.services.account_browser import AccountBrowserService
+from utils.account_browser import screenshots as renewal_screenshots
 
 account_browser_service = AccountBrowserService(db_manager, lambda: cookie_manager.manager)
 app.include_router(create_account_browser_router(
@@ -5418,12 +5419,13 @@ async def delete_risk_control_log(
         log_with_user('info', f"删除风控日志记录: {log_id}", current_user)
 
         is_admin = current_user.get("is_admin", False) or current_user.get("username") == ADMIN_USERNAME
-        success = db_manager.delete_risk_control_log(
-            log_id,
-            user_id=None if is_admin else current_user["user_id"],
-        )
+        owner = None if is_admin else current_user["user_id"]
+        record = db_manager.get_risk_control_log(log_id, user_id=owner)
+        success = db_manager.delete_risk_control_log(log_id, user_id=owner)
 
         if success:
+            if record:
+                renewal_screenshots.remove(record.get("screenshot"))
             log_with_user('info', f"风控日志删除成功: {log_id}", current_user)
             return {"success": True, "message": "删除成功"}
         else:
@@ -5433,6 +5435,24 @@ async def delete_risk_control_log(
     except Exception as e:
         log_with_user('error', f"删除风控日志失败: {log_id} - {str(e)}", current_user)
         return {"success": False, "message": f"删除失败: {str(e)}"}
+
+
+@app.get("/risk-control-logs/{log_id}/screenshot")
+async def get_risk_control_log_screenshot(
+    log_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """返回续期失败时保存的页面截图，只有账号所属用户和管理员能看。"""
+    from fastapi.responses import FileResponse
+
+    is_admin = current_user.get("is_admin", False) or current_user.get("username") == ADMIN_USERNAME
+    record = db_manager.get_risk_control_log(log_id, user_id=None if is_admin else current_user["user_id"])
+    if not record:
+        raise HTTPException(status_code=404, detail="日志不存在或无权访问")
+    file = renewal_screenshots.path(record.get("screenshot"))
+    if not file:
+        raise HTTPException(status_code=404, detail="截图不存在或已被清理，只保留最近 10 张")
+    return FileResponse(file, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/logs/stats")

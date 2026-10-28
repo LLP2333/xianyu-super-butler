@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from app.config import API_ENDPOINTS
 from utils.account_browser.listener import TokenListener, token_response
 from utils.account_browser.tokens import BrowserToken, TokenStore
+from utils import risk_control
 
 
 class StoreTests(unittest.TestCase):
@@ -60,29 +61,67 @@ class StoreTests(unittest.TestCase):
 
 
 class ListenerTests(unittest.IsolatedAsyncioTestCase):
-    async def test_open_home_then_click_actual_message_link(self):
-        link = SimpleNamespace(click=AsyncMock())
-        page = SimpleNamespace(url='about:blank', goto=AsyncMock(), get_by_role=MagicMock(return_value=link))
-        async def click(**kwargs):
-            page.goto.assert_awaited_once_with('https://www.goofish.com/', wait_until='domcontentloaded', timeout=20000)
-        link.click.side_effect = click
+    def home_page(self, url='about:blank', clicks=()):
+        """A page whose message link clicks succeed or raise in order."""
+        link = SimpleNamespace(click=AsyncMock(side_effect=list(clicks) or None))
+        located = SimpleNamespace(filter=MagicMock(return_value=SimpleNamespace(first=link)))
+        by_role = SimpleNamespace(or_=MagicMock(return_value=located))
+        page = SimpleNamespace(url=url, goto=AsyncMock(), reload=AsyncMock(), close=AsyncMock(),
+                               bring_to_front=AsyncMock(), get_by_role=MagicMock(return_value=by_role),
+                               locator=MagicMock(return_value='href-link'))
+        page.link, page.located = link, located
         self.listener.context.pages = [page]
         self.listener.context.new_page = AsyncMock()
         self.listener.ready.set()
+        return page
+
+    async def test_open_home_then_click_actual_message_link(self):
+        page = self.home_page()
+        async def click(**kwargs):
+            page.bring_to_front.assert_awaited_once()
+            page.goto.assert_awaited_once_with('https://www.goofish.com/', wait_until='domcontentloaded', timeout=20000)
+        page.link.click.side_effect = click
         await self.listener.open_messages()
-        page.get_by_role.assert_called_once_with('link', name='消息', exact=True)
-        link.click.assert_awaited_once_with(timeout=20000)
+        name = page.get_by_role.call_args.kwargs['name']
+        for text in ('消息', '消息 3', '消息99+'):
+            self.assertTrue(name.match(text), text)
+        self.assertFalse(name.match('消息通知'))
+        page.locator.assert_called_once_with('a[href$="/im"], a[href*="/im?"]')
+        page.located.filter.assert_called_once_with(visible=True)
+        page.link.click.assert_awaited_once_with(timeout=15000)
+        page.reload.assert_not_awaited()
         self.listener.context.new_page.assert_not_awaited()
+        self.assertIs(self.listener.message_page, page)
+
+    async def test_failed_click_on_homepage_reloads_once_and_succeeds(self):
+        page = self.home_page(clicks=[RuntimeError('timeout'), None])
+        page.url = 'https://www.goofish.com/'
+        await self.listener.open_messages()
+        page.reload.assert_awaited_once_with(wait_until='domcontentloaded', timeout=20000)
+        self.assertEqual(page.link.click.await_count, 2)
 
     async def test_blocked_message_click_does_not_navigate_directly_or_close(self):
-        link = SimpleNamespace(click=AsyncMock(side_effect=RuntimeError('blocked')))
-        page = SimpleNamespace(url='https://www.goofish.com/', goto=AsyncMock(), close=AsyncMock(), get_by_role=MagicMock(return_value=link))
-        self.listener.context.pages = [page]
-        self.listener.ready.set()
+        page = self.home_page('https://www.goofish.com/', clicks=[RuntimeError('blocked'), RuntimeError('blocked')])
         with self.assertRaises(RuntimeError):
             await self.listener.open_messages()
         self.assertEqual(page.goto.await_count, 1)
+        page.reload.assert_awaited_once()
         page.close.assert_not_awaited()
+
+    async def test_login_page_or_slider_is_not_reloaded(self):
+        page = self.home_page(clicks=[RuntimeError('login')])
+        async def to_login(*args, **kwargs):
+            page.url = 'https://passport.goofish.com/mini_login.htm'
+        page.goto.side_effect = to_login
+        with self.assertRaises(RuntimeError):
+            await self.listener.open_messages()
+        page.reload.assert_not_awaited()
+        page = self.home_page('https://www.goofish.com/', clicks=[RuntimeError('slider')])
+        with patch('utils.risk_control.registry', risk_control.RiskControlRegistry()):
+            risk_control.registry.get('a').require_verification('闲鱼要求验证')
+            with self.assertRaises(RuntimeError):
+                await self.listener.open_messages()
+        page.reload.assert_not_awaited()
 
     def setUp(self):
         self.store = TokenStore()

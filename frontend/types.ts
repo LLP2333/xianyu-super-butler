@@ -403,6 +403,8 @@ export interface RiskControlLog {
   processing_result?: string;
   processing_status: 'processing' | 'success' | 'failed' | string;
   error_message?: string;
+  /** 续期失败时的页面截图文件名，通过接口按权限读取 */
+  screenshot?: string | null;
   created_at: string;
   updated_at?: string;
 }

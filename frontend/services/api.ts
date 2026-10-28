@@ -1089,6 +1089,11 @@ export const deleteRiskControlLog = async (logId: number): Promise<ApiResponse> 
   return del(`/risk-control-logs/${logId}`);
 };
 
+/** 截图要带登录凭证读取，不能直接用 <img src>。 */
+export const getRiskControlLogScreenshot = async (logId: number): Promise<Blob> => {
+  return get(`/risk-control-logs/${logId}/screenshot`, undefined, { responseType: 'blob' });
+};
+
 export const getSystemLogs = async (params: {
   lines?: number;
   level?: string;

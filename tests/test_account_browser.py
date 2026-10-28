@@ -55,7 +55,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         def listener(key, expected, browser, callback):
             return SimpleNamespace(account_id=key, expected_account=expected, browser=browser,
                 current_account=AsyncMock(return_value='123'), start=AsyncMock(), close=AsyncMock(), close_goofish_pages=AsyncMock(), open_messages=AsyncMock(),
-                context=object(), task=SimpleNamespace(done=lambda:False), ready=SimpleNamespace(is_set=lambda:True), error=None)
+                context=object(), task=SimpleNamespace(done=lambda:False), ready=SimpleNamespace(is_set=lambda:True), error=None, message_page=None)
         p=patch('app.services.account_browser.TokenListener',side_effect=listener)
         p.start();self.addCleanup(p.stop)
 
@@ -403,7 +403,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(account_id=key, expected_account=expected, browser=browser,
                 current_account=AsyncMock(return_value='123'), start=AsyncMock(), close=AsyncMock(),
                 close_goofish_pages=AsyncMock(), open_messages=AsyncMock(side_effect=lambda: asyncio.create_task(open_messages())),
-                context=object(), task=SimpleNamespace(done=lambda: False), ready=SimpleNamespace(is_set=lambda: True), error=None)
+                context=object(), task=SimpleNamespace(done=lambda: False), ready=SimpleNamespace(is_set=lambda: True), error=None, message_page=None)
         with patch('app.services.account_browser.TokenListener', side_effect=listener), \
                 patch('app.services.account_browser.schedule_manual_verification_notification') as notify:
             await self.service.renew('123', 7)
@@ -432,7 +432,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             result = SimpleNamespace(account_id=key, expected_account=expected, browser=browser,
                 current_account=AsyncMock(return_value='123'), start=AsyncMock(), close=AsyncMock(),
                 close_goofish_pages=AsyncMock(), context=object(), task=SimpleNamespace(done=lambda: False),
-                ready=SimpleNamespace(is_set=lambda: True), error=None)
+                ready=SimpleNamespace(is_set=lambda: True), error=None, message_page=None)
             result.open_messages = AsyncMock(side_effect=lambda: result.on_challenge(key))
             return result
         with patch('app.services.account_browser.TokenListener', side_effect=listener), \
@@ -456,7 +456,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(account_id=key, expected_account=expected, browser=browser,
                 current_account=AsyncMock(return_value='123'), start=AsyncMock(), close=AsyncMock(),
                 close_goofish_pages=AsyncMock(), context=object(), task=SimpleNamespace(done=lambda: False),
-                ready=SimpleNamespace(is_set=lambda: True), error=None,
+                ready=SimpleNamespace(is_set=lambda: True), error=None, message_page=None,
                 open_messages=AsyncMock(side_effect=lambda: asyncio.create_task(capture()) if succeed else None))
         self.service.listener = None
         with patch('app.services.account_browser.TokenListener', side_effect=listener), \
@@ -503,6 +503,42 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.renew_failures, 3)
         notify.assert_called_once()
         self.assertEqual(notify.call_args.args[2], '凭据到期 · 自动续期失败')
+
+    async def test_failed_entry_records_real_cause_page_and_screenshot(self):
+        await self.service.ensure(7, '123', self.records['123'])
+        page = SimpleNamespace(url='https://www.goofish.com/')
+        self.service.listener.message_page = page
+        self.service.listener.open_messages.side_effect = TimeoutError('Locator.click: Timeout 15000ms exceeded')
+        with patch('app.services.account_browser.screenshots.save', AsyncMock(return_value='renewal_123_1.jpg')) as save:
+            await self.service.fetch_credentials('123', 7)
+        save.assert_awaited_once_with(page, '123')
+        kwargs = self.db.add_risk_control_log.call_args.kwargs
+        self.assertEqual(kwargs['event_type'], 'message_entry_failed')
+        self.assertEqual(kwargs['processing_status'], 'failed')
+        self.assertEqual(kwargs['screenshot'], 'renewal_123_1.jpg')
+        self.assertIn('TimeoutError: Locator.click', kwargs['error_message'])
+        self.assertEqual(kwargs['processing_result'], '页面: https://www.goofish.com/')
+
+    async def test_failed_screenshot_or_log_never_changes_failure_handling(self):
+        await self.service.ensure(7, '123', self.records['123'])
+        self.service.listener.open_messages.side_effect = RuntimeError('blocked')
+        self.db.add_risk_control_log.side_effect = RuntimeError('db locked')
+        with patch('app.services.account_browser.screenshots.save', AsyncMock(return_value=None)):
+            result = await self.service.fetch_credentials('123', 7)
+        self.assertIn('页面已保留', result['message'])
+        self.assertIsNone(self.db.add_risk_control_log.call_args.kwargs['screenshot'])
+
+    async def test_first_renewal_failure_retries_sooner_then_backs_off(self):
+        self.adopt_aged(3500)
+        with patch('app.services.account_browser.RENEW_WAIT', 0), \
+                patch('app.services.account_browser.screenshots.save', AsyncMock(return_value=None)), \
+                patch('app.services.account_browser.schedule_manual_verification_notification'), \
+                patch('app.services.account_browser.time.monotonic', return_value=1000.0):
+            await self.service.renew('123', 7)
+            self.assertEqual(self.service.next_renew_at, 1060.0)
+            await self.service.renew('123', 7)
+            self.assertEqual(self.service.next_renew_at, 1300.0)
+        self.assertEqual(self.db.add_risk_control_log.call_args.kwargs['event_type'], 'credential_renewal_failed')
 
     async def test_fetch_rejects_wrong_owner_disabled_and_duplicate(self):
         with self.assertRaises(LookupError):

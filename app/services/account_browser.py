@@ -10,6 +10,7 @@ from utils.account_browser.manager import BrowserManager
 from utils.account_browser.listener import TokenListener
 from utils.account_browser.tokens import TOKEN_MAX_AGE, tokens
 from utils.account_browser.credentials import cookie_expired, invalidate_credentials, WAITING
+from utils.account_browser import screenshots
 from utils.xianyu_utils import trans_cookies
 from utils import risk_control
 
@@ -18,12 +19,20 @@ PENDING = 'browser-onboarding'
 
 # 消息 Token 到期前多久由浏览器自动续期（秒）
 RENEW_BEFORE = 600
-# 自动续期失败后的重试间隔（秒）
+# 自动续期失败后的重试间隔（秒）；第一次失败多为偶发，先尽快重试
+RENEW_FIRST_RETRY = 60
 RENEW_RETRY = 300
 # 打开消息页后等待捕获新 Token 的时长（秒）
 RENEW_WAIT = 90
 # 连续失败几次后通知用户
 RENEW_NOTIFY_AFTER = 2
+# 风控日志里的事件类型
+MESSAGE_ENTRY_EVENT = 'message_entry_failed'
+RENEWAL_FAILED_EVENT = 'credential_renewal_failed'
+
+
+def describe(exc):
+    return f'{type(exc).__name__}: {exc}'
 
 
 class AccountBrowserService:
@@ -300,13 +309,27 @@ class AccountBrowserService:
                     await self.listener.open_messages()
                 except asyncio.CancelledError:
                     raise
-                except Exception:
+                except Exception as exc:
                     self.errors[account_id] = '未能进入闲鱼消息页，请打开原生 Chrome 桌面检查登录或验证；页面已保留'
                     invalidate_credentials(account_id, self.errors[account_id])
+                    await self.record_failure(account_id, MESSAGE_ENTRY_EVENT, '未能进入闲鱼消息页', describe(exc))
                 return {**self.listener_status(), **self.credential_status(account_id),
                         'desktop_url': self.desktop_url(user_id) if self.listener_status()['browser_running'] else None}
         finally:
             self.opening_messages.discard(account_id)
+
+    async def record_failure(self, account_id, event_type, reason, detail):
+        """Log the real cause with the page URL and a screenshot, and keep it in the risk-control logs."""
+        page = self.listener.message_page if self.listener else None
+        url = page.url if page is not None else None
+        shot = await screenshots.save(page, account_id)
+        logger.warning(f'【{account_id}】{reason}：{detail}；页面: {url or "无"}；截图: {shot or "无"}')
+        try:
+            self.db.add_risk_control_log(cookie_id=account_id, event_type=event_type, event_description=reason,
+                                         processing_result=f'页面: {url}' if url else None,
+                                         processing_status='failed', error_message=detail[:1000], screenshot=shot)
+        except Exception as exc:
+            logger.warning(f'【{account_id}】记录续期失败日志失败: {type(exc).__name__}')
 
     async def status(self, account_id, user_id):
         self.account(account_id, user_id)
@@ -431,12 +454,15 @@ class AccountBrowserService:
                     break
                 if time.monotonic() >= deadline:
                     error = '已打开闲鱼消息页，但未捕获到新的消息 Token'
+                    await self.record_failure(account_id, RENEWAL_FAILED_EVENT, '自动续期失败',
+                                              f'{RENEW_WAIT} 秒内未捕获到新的消息 Token')
                     break
                 await asyncio.sleep(2)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             error = str(exc) if isinstance(exc, (LookupError, RuntimeError, ValueError)) else '自动续期异常'
+            await self.record_failure(account_id, RENEWAL_FAILED_EVENT, '自动续期失败', describe(exc))
         if error is None:
             self.renew_failures = 0
             self.next_renew_at = 0.0
@@ -448,10 +474,11 @@ class AccountBrowserService:
                     RECOVERED_TITLE, RECOVERED_HINT, RECOVERED_EVENT)
             return
         self.renew_failures += 1
-        self.next_renew_at = time.monotonic() + RENEW_RETRY
+        retry = RENEW_FIRST_RETRY if self.renew_failures == 1 else RENEW_RETRY
+        self.next_renew_at = time.monotonic() + retry
         reason = f'自动续期失败：{error}'
         invalidate_credentials(account_id, reason)
-        logger.warning(f'【{account_id}】{reason}（连续第 {self.renew_failures} 次），{RENEW_RETRY} 秒后重试')
+        logger.warning(f'【{account_id}】{reason}（连续第 {self.renew_failures} 次），{retry} 秒后重试')
         if self.renew_failures == RENEW_NOTIFY_AFTER:
             self.renewal_alerted = True
             schedule_manual_verification_notification(account_id, error, RENEWAL_TITLE, RENEWAL_HINT, RENEWAL_EVENT)

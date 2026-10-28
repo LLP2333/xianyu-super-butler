@@ -8,6 +8,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Edit3,
+  ImageIcon,
   Link2,
   Loader2,
   Plus,
@@ -40,6 +41,7 @@ import {
   getNotificationChannels,
   getNotificationEvents,
   getRiskControlLogs,
+  getRiskControlLogScreenshot,
   getSystemLogs,
   setMessageNotification,
   testMessageNotification,
@@ -188,6 +190,8 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
   const [riskStatus, setRiskStatus] = useState('');
   const [riskPage, setRiskPage] = useState(0);
   const [riskLoading, setRiskLoading] = useState(false);
+  const [screenshot, setScreenshot] = useState<{ url: string; log: RiskControlLog } | null>(null);
+  const [loadingScreenshot, setLoadingScreenshot] = useState<number | null>(null);
   const [systemLogs, setSystemLogs] = useState<SystemLog[]>([]);
   const [systemLevel, setSystemLevel] = useState('');
   const [systemSource, setSystemSource] = useState('');
@@ -474,6 +478,23 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
     } catch (error) {
       notify(`删除风控日志失败：${(error as Error).message}`);
     }
+  };
+
+  const openScreenshot = async (log: RiskControlLog) => {
+    setLoadingScreenshot(log.id);
+    try {
+      const blob = await getRiskControlLogScreenshot(log.id);
+      setScreenshot({ url: URL.createObjectURL(blob), log });
+    } catch {
+      notify('截图不存在或已被清理，只保留最近 10 张');
+    } finally {
+      setLoadingScreenshot(null);
+    }
+  };
+
+  const closeScreenshot = () => {
+    if (screenshot) URL.revokeObjectURL(screenshot.url);
+    setScreenshot(null);
   };
 
   const loadSystemLogs = async () => {
@@ -788,6 +809,17 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                   {log.error_message && (
                     <p className="mt-1 break-words text-xs text-red-600">{log.error_message}</p>
                   )}
+                  {log.screenshot && (
+                    <button
+                      type="button"
+                      onClick={() => void openScreenshot(log)}
+                      disabled={loadingScreenshot === log.id}
+                      className="mt-2 inline-flex items-center gap-1.5 rounded-md bg-gray-100 px-2.5 py-1 text-xs font-bold text-gray-700 hover:bg-gray-200 disabled:opacity-50"
+                    >
+                      {loadingScreenshot === log.id ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ImageIcon className="h-3.5 w-3.5" />}
+                      查看截图
+                    </button>
+                  )}
                 </div>
                 <button
                   type="button"
@@ -986,6 +1018,32 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                 {savingChannel ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
                 保存
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {screenshot && (
+        <div className="modal-overlay" onClick={closeScreenshot}>
+          <div className="modal-container max-w-5xl" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header flex items-start justify-between gap-4">
+              <div>
+                <h3 className="text-lg font-bold text-gray-900">失败时的页面截图</h3>
+                <p className="mt-1 text-sm text-gray-500">
+                  {screenshot.log.cookie_id} · {formatTime(screenshot.log.created_at)}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={closeScreenshot}
+                title="关闭"
+                className="flex h-9 w-9 items-center justify-center rounded-md text-gray-500 hover:bg-gray-100"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            <div className="modal-body">
+              <img src={screenshot.url} alt="续期失败时的闲鱼页面" className="w-full rounded-md border border-gray-200" />
             </div>
           </div>
         </div>

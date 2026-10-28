@@ -1,6 +1,7 @@
 """Observe website-owned Tokens and open the message entry on explicit user request."""
 import asyncio
 import json
+import re
 from urllib.parse import parse_qs, urlsplit
 
 from app.config import API_ENDPOINTS
@@ -9,6 +10,10 @@ from utils.manual_captcha import _from_playwright_cookies
 from utils.xianyu_utils import trans_cookies
 from .credentials import credential_error_kind
 from .tokens import BrowserToken, tokens
+
+# 「消息」or「消息 3」/「消息99+」when there are unread messages.
+MESSAGE_LINK = re.compile(r'^\s*消息\s*(\d+\+?)?\s*$')
+MESSAGE_CLICK_TIMEOUT = 15000
 
 
 def token_response(url, request_body, payload):
@@ -49,6 +54,7 @@ class TokenListener:
         self.error = None
         self.context = None
         self.pending = set()
+        self.message_page = None
 
     async def start(self):
         if self.task and not self.task.done():
@@ -118,9 +124,31 @@ class TokenListener:
             page = next((p for p in self.context.pages if p.url == 'about:blank'), None)
         if page is None:
             page = await self.context.new_page()
+        # Kept so a failure can be logged with this page's URL and screenshot.
+        self.message_page = page
+        # A background tab never passes Playwright's stability check, so the click would only time out.
+        await page.bring_to_front()
         await page.goto('https://www.goofish.com/', wait_until='domcontentloaded', timeout=20000)
+        try:
+            await self.click_messages(page)
+        except Exception:
+            if not self.can_retry(page):
+                raise
+            await page.reload(wait_until='domcontentloaded', timeout=20000)
+            await self.click_messages(page)
+
+    async def click_messages(self, page):
         # Do not force a click through login/verification overlays or bypass the homepage.
-        await page.get_by_role('link', name='消息', exact=True).click(timeout=20000)
+        # The unread badge can join the link's name; the /im link is the fallback when the name differs.
+        link = page.get_by_role('link', name=MESSAGE_LINK).or_(page.locator('a[href$="/im"], a[href*="/im?"]'))
+        await link.filter(visible=True).first.click(timeout=MESSAGE_CLICK_TIMEOUT)
+
+    def can_retry(self, page):
+        """Reload once on the homepage only; a login page or a slider is left untouched for the user."""
+        if risk_control.registry.get(self.account_id).verification_kind == risk_control.VERIFICATION_RISK:
+            return False
+        url = urlsplit(page.url)
+        return url.hostname in ('goofish.com', 'www.goofish.com') and url.path in ('', '/')
 
     async def close_goofish_pages(self):
         """End website messaging without closing Chrome or clearing its profile."""
