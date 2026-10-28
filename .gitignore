@@ -85,6 +85,10 @@ keywords_*.xlsx
 static/uploads/*
 !static/uploads/.gitkeep
 
+# 前端构建产物（由 frontend 构建生成，不入库）
+static/assets/
+static/index.html
+
 # 配置文件（包含敏感信息）
 config.local.yml
 global_config.local.yml

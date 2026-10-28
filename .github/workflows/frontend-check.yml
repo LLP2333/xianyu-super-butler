@@ -1,0 +1,49 @@
+# 前端类型检查与构建
+#
+# 构建产物（static/assets、static/index.html）不再入库：Docker 镜像在
+# frontend-builder 阶段自行构建，本地 `python Start.py` 发现产物缺失或过期时
+# 会自动 npm ci + npm run build。这里在每次推送时确认源码能编译通过。
+
+name: Frontend check
+
+on:
+  push:
+    branches:
+      - personal
+      - main
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend-check.yml'
+  pull_request:
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend-check.yml'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      # 输出到 frontend/dist，不触碰仓库根目录的 static/
+      - name: Build
+        run: VITE_OUT_DIR=dist npm run build

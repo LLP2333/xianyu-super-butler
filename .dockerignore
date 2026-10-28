@@ -16,6 +16,10 @@ frontend/node_modules/
 frontend/dist/
 frontend/coverage/
 
+# 镜像内由 frontend-builder 阶段重新生成，避免带入本地旧产物
+static/assets/
+static/index.html
+
 data/
 logs/
 backups/

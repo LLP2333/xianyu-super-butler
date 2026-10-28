@@ -173,6 +173,8 @@ cd frontend && npm ci && npm run build && cd ..
 python Start.py
 ```
 
+前端构建产物（`static/assets/`、`static/index.html`）不入库。`Start.py` 启动时发现产物缺失或比源码旧，会自动执行 `npm ci` 和 `npm run build`；Docker 镜像在构建阶段自行编译前端。
+
 ### 访问
 
 - 管理页面：`http://localhost:8080/`
