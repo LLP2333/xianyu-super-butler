@@ -444,6 +444,53 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         renewal_notify.assert_not_called()
         self.service.listener.close_goofish_pages.assert_not_awaited()
 
+    def fresh_capture(self, token):
+        value = BrowserToken('123', token, 'device', 'app', f'unb=123; cookie2={token}')
+        self.store.observe(self.service.listener.account_id, value)
+        return value
+
+    async def renew_with(self, succeed, token):
+        async def capture():
+            await self.service.capture_credentials(self.fresh_capture(token))
+        def listener(key, expected, browser, callback):
+            return SimpleNamespace(account_id=key, expected_account=expected, browser=browser,
+                current_account=AsyncMock(return_value='123'), start=AsyncMock(), close=AsyncMock(),
+                close_goofish_pages=AsyncMock(), context=object(), task=SimpleNamespace(done=lambda: False),
+                ready=SimpleNamespace(is_set=lambda: True), error=None,
+                open_messages=AsyncMock(side_effect=lambda: asyncio.create_task(capture()) if succeed else None))
+        self.service.listener = None
+        with patch('app.services.account_browser.TokenListener', side_effect=listener), \
+                patch('app.services.account_browser.RENEW_WAIT', 0 if not succeed else 5):
+            await self.service.renew('123', 7)
+
+    async def test_automatic_recovery_after_alert_sends_recovery_notice(self):
+        self.adopt_aged(3500)
+        with patch('app.services.account_browser.schedule_manual_verification_notification') as notify:
+            await self.renew_with(False, 'a')
+            await self.renew_with(False, 'b')
+            await self.renew_with(True, 'recovered')
+        titles = [call.args[2] for call in notify.call_args_list]
+        self.assertEqual(titles, ['凭据到期 · 自动续期失败', '凭据已自动恢复'])
+        self.assertEqual(notify.call_args.args[4], 'credential_recovered')
+        self.assertFalse(self.service.renewal_alerted)
+
+    async def test_manual_fix_after_alert_sends_no_recovery_notice(self):
+        self.adopt_aged(3500)
+        with patch('app.services.account_browser.schedule_manual_verification_notification') as notify:
+            await self.renew_with(False, 'a')
+            await self.renew_with(False, 'b')
+            await self.service.capture_credentials(self.fresh_capture('manual'))
+            self.adopt_aged(3550)
+            await self.renew_with(True, 'later')
+        self.assertEqual([call.args[2] for call in notify.call_args_list], ['凭据到期 · 自动续期失败'])
+
+    async def test_success_without_prior_alert_sends_nothing(self):
+        self.adopt_aged(3500)
+        with patch('app.services.account_browser.schedule_manual_verification_notification') as notify:
+            await self.renew_with(False, 'a')
+            await self.renew_with(True, 'ok')
+        notify.assert_not_called()
+
     async def test_repeated_renewal_failure_notifies_once_as_expiry(self):
         self.adopt_aged(3500)
         with patch('app.services.account_browser.RENEW_WAIT', 0), \

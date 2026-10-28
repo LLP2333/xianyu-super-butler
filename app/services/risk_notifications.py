@@ -18,6 +18,9 @@ RENEWAL_TITLE = '凭据到期 · 自动续期失败'
 RENEWAL_EVENT = 'cookie_invalid'
 RENEWAL_HINT = ('消息 Token 已到期，原生浏览器自动续期没有成功，账号已暂停闲鱼请求。'
                 '请打开原生浏览器检查登录状态，再点击「获取新凭据」。')
+RECOVERED_TITLE = '凭据已自动恢复'
+RECOVERED_EVENT = 'credential_recovered'
+RECOVERED_HINT = '之前的自动续期失败已由系统自行恢复，账号已恢复闲鱼请求，无需处理。'
 
 
 def schedule_manual_verification_notification(account_id: str, reason: str, title: str = RISK_TITLE,

@@ -3,7 +3,8 @@ import asyncio
 import time
 from loguru import logger
 from app.config import TOKEN_REFRESH_INTERVAL
-from app.services.risk_notifications import (RENEWAL_EVENT, RENEWAL_HINT, RENEWAL_TITLE,
+from app.services.risk_notifications import (RECOVERED_EVENT, RECOVERED_HINT, RECOVERED_TITLE,
+                                             RENEWAL_EVENT, RENEWAL_HINT, RENEWAL_TITLE,
                                              schedule_manual_verification_notification)
 from utils.account_browser.manager import BrowserManager
 from utils.account_browser.listener import TokenListener
@@ -41,6 +42,8 @@ class AccountBrowserService:
         self.renew_task = None
         self.renew_failures = 0
         self.next_renew_at = 0.0
+        # A renewal-failure alert was sent and no later capture has resolved it yet.
+        self.renewal_alerted = False
 
     def account(self, account_id, user_id):
         record = self.db.get_cookie_details(account_id)
@@ -172,6 +175,8 @@ class AccountBrowserService:
                 self.setup_error = None
                 self.renew_failures = 0
                 self.next_renew_at = 0.0
+                # Any capture resolves the alert; renew() alone decides whether it was automatic.
+                self.renewal_alerted = False
             except asyncio.CancelledError:
                 if account_id != PENDING:
                     await self.pause_account(account_id, '凭据采用被中断，等待网页重新获取', force=True)
@@ -408,6 +413,8 @@ class AccountBrowserService:
     async def renew(self, account_id, user_id):
         """Do what the "获取新凭据" button does, before the Token expires."""
         before = tokens.active(account_id)
+        # Snapshot before fetching: a manual capture in between already cleared it, and then the user intervened.
+        alerted, failures = self.renewal_alerted, self.renew_failures
         logger.info(f'【{account_id}】消息 Token 即将到期或已到期，原生浏览器自动续期')
         error = None
         try:
@@ -433,7 +440,12 @@ class AccountBrowserService:
         if error is None:
             self.renew_failures = 0
             self.next_renew_at = 0.0
+            self.renewal_alerted = False
             logger.info(f'【{account_id}】消息 Token 自动续期成功')
+            if alerted:
+                schedule_manual_verification_notification(
+                    account_id, f'连续 {failures} 次自动续期失败后，本次自动续期成功',
+                    RECOVERED_TITLE, RECOVERED_HINT, RECOVERED_EVENT)
             return
         self.renew_failures += 1
         self.next_renew_at = time.monotonic() + RENEW_RETRY
@@ -441,6 +453,7 @@ class AccountBrowserService:
         invalidate_credentials(account_id, reason)
         logger.warning(f'【{account_id}】{reason}（连续第 {self.renew_failures} 次），{RENEW_RETRY} 秒后重试')
         if self.renew_failures == RENEW_NOTIFY_AFTER:
+            self.renewal_alerted = True
             schedule_manual_verification_notification(account_id, error, RENEWAL_TITLE, RENEWAL_HINT, RENEWAL_EVENT)
 
     async def run(self):

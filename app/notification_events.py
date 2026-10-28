@@ -73,6 +73,12 @@ EVENT_DEFINITIONS: List[Dict[str, str]] = [
         "description": "密码登录成功、滑块验证成功等",
     },
     {
+        "id": "credential_recovered",
+        "label": "凭据自动恢复",
+        "priority": "info",
+        "description": "续期失败告警后，系统自行续期成功；人工处理恢复的不通知",
+    },
+    {
         "id": "buyer_message",
         "label": "买家消息",
         "priority": "info",
