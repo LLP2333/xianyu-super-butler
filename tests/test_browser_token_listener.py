@@ -66,7 +66,7 @@ class ListenerTests(unittest.IsolatedAsyncioTestCase):
         link = SimpleNamespace(click=AsyncMock(side_effect=list(clicks) or None))
         located = SimpleNamespace(filter=MagicMock(return_value=SimpleNamespace(first=link)))
         by_role = SimpleNamespace(or_=MagicMock(return_value=located))
-        page = SimpleNamespace(url=url, goto=AsyncMock(), reload=AsyncMock(), close=AsyncMock(),
+        page = SimpleNamespace(url=url, goto=AsyncMock(), close=AsyncMock(),
                                bring_to_front=AsyncMock(), get_by_role=MagicMock(return_value=by_role),
                                locator=MagicMock(return_value='href-link'))
         page.link, page.located = link, located
@@ -89,23 +89,37 @@ class ListenerTests(unittest.IsolatedAsyncioTestCase):
         page.locator.assert_called_once_with('a[href$="/im"], a[href*="/im?"]')
         page.located.filter.assert_called_once_with(visible=True)
         page.link.click.assert_awaited_once_with(timeout=15000)
-        page.reload.assert_not_awaited()
         self.listener.context.new_page.assert_not_awaited()
         self.assertIs(self.listener.message_page, page)
 
-    async def test_failed_click_on_homepage_reloads_once_and_succeeds(self):
+    async def test_failed_click_on_homepage_loads_it_once_more_and_succeeds(self):
         page = self.home_page(clicks=[RuntimeError('timeout'), None])
         page.url = 'https://www.goofish.com/'
         await self.listener.open_messages()
-        page.reload.assert_awaited_once_with(wait_until='domcontentloaded', timeout=20000)
+        page.goto.assert_awaited_with('https://www.goofish.com/', wait_until='domcontentloaded', timeout=30000)
+        self.assertEqual(page.goto.await_count, 2)
         self.assertEqual(page.link.click.await_count, 2)
+
+    async def test_homepage_stuck_on_skeleton_from_blank_tab_is_loaded_again(self):
+        page = self.home_page()
+        page.goto.side_effect = [TimeoutError('Page.goto: Timeout 20000ms exceeded'), None]
+        await self.listener.open_messages()
+        self.assertEqual(page.goto.await_count, 2)
+        page.link.click.assert_awaited_once()
+
+    async def test_second_homepage_timeout_is_raised(self):
+        page = self.home_page('https://www.goofish.com/')
+        page.goto.side_effect = TimeoutError('Page.goto: Timeout exceeded')
+        with self.assertRaises(TimeoutError):
+            await self.listener.open_messages()
+        self.assertEqual(page.goto.await_count, 2)
+        page.link.click.assert_not_awaited()
 
     async def test_blocked_message_click_does_not_navigate_directly_or_close(self):
         page = self.home_page('https://www.goofish.com/', clicks=[RuntimeError('blocked'), RuntimeError('blocked')])
         with self.assertRaises(RuntimeError):
             await self.listener.open_messages()
-        self.assertEqual(page.goto.await_count, 1)
-        page.reload.assert_awaited_once()
+        self.assertEqual([call.args for call in page.goto.await_args_list], [('https://www.goofish.com/',)] * 2)
         page.close.assert_not_awaited()
 
     async def test_login_page_or_slider_is_not_reloaded(self):
@@ -115,13 +129,13 @@ class ListenerTests(unittest.IsolatedAsyncioTestCase):
         page.goto.side_effect = to_login
         with self.assertRaises(RuntimeError):
             await self.listener.open_messages()
-        page.reload.assert_not_awaited()
+        self.assertEqual(page.goto.await_count, 1)
         page = self.home_page('https://www.goofish.com/', clicks=[RuntimeError('slider')])
         with patch('utils.risk_control.registry', risk_control.RiskControlRegistry()):
             risk_control.registry.get('a').require_verification('闲鱼要求验证')
             with self.assertRaises(RuntimeError):
                 await self.listener.open_messages()
-        page.reload.assert_not_awaited()
+        self.assertEqual(page.goto.await_count, 1)
 
     def setUp(self):
         self.store = TokenStore()

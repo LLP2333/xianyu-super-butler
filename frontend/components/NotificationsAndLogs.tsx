@@ -162,6 +162,12 @@ const formatTime = (value?: string) => {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString('zh-CN');
 };
 
+/** SQLite CURRENT_TIMESTAMP is UTC without a zone ("2026-10-28 08:01:48"); show it in local time. */
+const formatDbTime = (value?: string) => {
+  if (!value) return '-';
+  return formatTime(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?$/.test(value) ? `${value.replace(' ', 'T')}Z` : value);
+};
+
 const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) => {
   const [activeTab, setActiveTab] = useState<PageTab>('channels');
   const [accounts, setAccounts] = useState<AccountDetail[]>([]);
@@ -593,7 +599,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
                   </div>
                   <p className="mt-1 text-xs text-gray-500">
                     {channel.enabled ? '可用于账号通知' : '已停用'}
-                    {channel.updated_at ? ` · 更新于 ${formatTime(channel.updated_at)}` : ''}
+                    {channel.updated_at ? ` · 更新于 ${formatDbTime(channel.updated_at)}` : ''}
                   </p>
                 </div>
                 <div className="flex gap-2">
@@ -787,7 +793,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
               <div key={log.id} className="grid gap-3 py-4 lg:grid-cols-[180px_120px_minmax(0,1fr)_44px] lg:items-start">
                 <div>
                   <p className="break-all text-sm font-bold text-gray-900">{log.cookie_id}</p>
-                  <p className="mt-1 text-xs text-gray-500">{formatTime(log.created_at)}</p>
+                  <p className="mt-1 text-xs text-gray-500">{formatDbTime(log.created_at)}</p>
                 </div>
                 <div>
                   <span className={`inline-flex rounded px-2 py-1 text-xs font-bold ${
@@ -1030,7 +1036,7 @@ const NotificationsAndLogs: React.FC<NotificationsAndLogsProps> = ({ isAdmin }) 
               <div>
                 <h3 className="text-lg font-bold text-gray-900">失败时的页面截图</h3>
                 <p className="mt-1 text-sm text-gray-500">
-                  {screenshot.log.cookie_id} · {formatTime(screenshot.log.created_at)}
+                  {screenshot.log.cookie_id} · {formatDbTime(screenshot.log.created_at)}
                 </p>
               </div>
               <button

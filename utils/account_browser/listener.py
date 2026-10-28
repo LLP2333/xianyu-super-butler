@@ -14,6 +14,7 @@ from .tokens import BrowserToken, tokens
 # 「消息」or「消息 3」/「消息99+」when there are unread messages.
 MESSAGE_LINK = re.compile(r'^\s*消息\s*(\d+\+?)?\s*$')
 MESSAGE_CLICK_TIMEOUT = 15000
+HOME = 'https://www.goofish.com/'
 
 
 def token_response(url, request_body, payload):
@@ -128,13 +129,14 @@ class TokenListener:
         self.message_page = page
         # A background tab never passes Playwright's stability check, so the click would only time out.
         await page.bring_to_front()
-        await page.goto('https://www.goofish.com/', wait_until='domcontentloaded', timeout=20000)
+        # The homepage sometimes stalls on its loading skeleton; a second load usually goes through.
         try:
+            await page.goto(HOME, wait_until='domcontentloaded', timeout=20000)
             await self.click_messages(page)
         except Exception:
             if not self.can_retry(page):
                 raise
-            await page.reload(wait_until='domcontentloaded', timeout=20000)
+            await page.goto(HOME, wait_until='domcontentloaded', timeout=30000)
             await self.click_messages(page)
 
     async def click_messages(self, page):
@@ -144,9 +146,11 @@ class TokenListener:
         await link.filter(visible=True).first.click(timeout=MESSAGE_CLICK_TIMEOUT)
 
     def can_retry(self, page):
-        """Reload once on the homepage only; a login page or a slider is left untouched for the user."""
+        """Load the homepage once more only from it (or a blank tab); a login page or a slider is left for the user."""
         if risk_control.registry.get(self.account_id).verification_kind == risk_control.VERIFICATION_RISK:
             return False
+        if page.url == 'about:blank':
+            return True
         url = urlsplit(page.url)
         return url.hostname in ('goofish.com', 'www.goofish.com') and url.path in ('', '/')
 
