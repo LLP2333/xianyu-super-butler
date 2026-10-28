@@ -180,6 +180,18 @@ class ListenerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.store.get('a', candidate=True))
         self.listener.context.cookies.assert_not_awaited()
 
+    async def test_website_slider_is_reported_without_capturing(self):
+        challenged = []
+        self.listener.on_challenge = challenged.append
+        self.response.json.return_value = {'ret':['FAIL_SYS_USER_VALIDATE', 'RGV587_ERROR::SM::哎哟喂'],
+                                           'data':{'url':'https://example.test/punish?action=captcha'}}
+        await self.listener.consume(self.response)
+        self.assertEqual(challenged, ['a'])
+        self.assertIsNone(self.store.get('a', candidate=True))
+        self.response.json.return_value = {'ret':['FAIL_SYS_TOKEN_EXOIRED::令牌过期']}
+        await self.listener.consume(self.response)
+        self.assertEqual(challenged, ['a'])
+
     def test_missing_device_parameters_and_malformed_payload_are_rejected(self):
         payload = {'data': {'accessToken':'token'}}
         for body in ('', 'data=not-json', 'data=%7B%7D', 'data=null'):

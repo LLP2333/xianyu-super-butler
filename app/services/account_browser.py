@@ -98,6 +98,7 @@ class AccountBrowserService:
             self.listener = None
         if self.listener is None:
             self.listener = TokenListener(key, expected, browser, self.capture_credentials)
+            self.listener.on_challenge = self.capture_challenge
         await self.listener.start()
         return browser
 
@@ -182,6 +183,22 @@ class AccountBrowserService:
                     self.errors[account_id] = message
                 else:
                     self.setup_error = message
+
+    def capture_challenge(self, account_id):
+        """The website itself asked for a slider: stop renewing so the page is left for the user."""
+        if account_id == PENDING:
+            return
+        guard = risk_control.registry.get(account_id)
+        # A healthy account keeps its working Token; only a waiting one becomes manual verification.
+        if not guard.verification_required or guard.verification_kind == risk_control.VERIFICATION_RISK:
+            return
+        reason = '闲鱼在原生浏览器弹出滑块或安全验证，请打开原生 Chrome 桌面完成验证；完成后自动恢复'
+        guard.require_verification(reason)
+        try:
+            self.db.add_risk_control_log(cookie_id=account_id, event_type='slider_captcha',
+                                         event_description=reason, processing_status='pending')
+        except Exception as exc:
+            logger.warning(f'【{account_id}】记录人工验证提示失败: {type(exc).__name__}')
 
     def credential_status(self, account_id):
         value = tokens.get(account_id)
@@ -397,6 +414,9 @@ class AccountBrowserService:
             await self.fetch_credentials(account_id, user_id)
             deadline = time.monotonic() + RENEW_WAIT
             while True:
+                if risk_control.registry.get(account_id).verification_kind == risk_control.VERIFICATION_RISK:
+                    logger.warning(f'【{account_id}】自动续期遇到闲鱼验证，停止续期，等待人工处理')
+                    return
                 error = self.errors.get(account_id)
                 value = tokens.active(account_id)
                 if error or (value is not None and value is not before

@@ -412,6 +412,38 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.renew_failures, 0)
         notify.assert_not_called()
 
+    async def test_website_slider_turns_waiting_account_into_manual_verification(self):
+        self.adopt_aged(60)
+        self.service.capture_challenge('123')
+        self.assertFalse(risk_control.registry.get('123').verification_required)
+        risk_control.registry.get('123').require_verification('正在续期', 'renewing')
+        with patch('app.services.risk_notifications.schedule_manual_verification_notification') as notify:
+            self.service.capture_challenge('123')
+        guard = risk_control.registry.get('123')
+        self.assertEqual(guard.verification_kind, 'risk')
+        self.assertIn('滑块', guard.last_hit_reason)
+        notify.assert_called_once()
+        self.db.add_risk_control_log.assert_called_once()
+        self.assertFalse(self.service.renewal_due('123'))
+
+    async def test_renew_stops_on_slider_without_counting_failure(self):
+        self.adopt_aged(3500)
+        def listener(key, expected, browser, callback):
+            result = SimpleNamespace(account_id=key, expected_account=expected, browser=browser,
+                current_account=AsyncMock(return_value='123'), start=AsyncMock(), close=AsyncMock(),
+                close_goofish_pages=AsyncMock(), context=object(), task=SimpleNamespace(done=lambda: False),
+                ready=SimpleNamespace(is_set=lambda: True), error=None)
+            result.open_messages = AsyncMock(side_effect=lambda: result.on_challenge(key))
+            return result
+        with patch('app.services.account_browser.TokenListener', side_effect=listener), \
+                patch('app.services.risk_notifications.schedule_manual_verification_notification'), \
+                patch('app.services.account_browser.schedule_manual_verification_notification') as renewal_notify:
+            await self.service.renew('123', 7)
+        self.assertEqual(self.service.renew_failures, 0)
+        self.assertEqual(risk_control.registry.get('123').verification_kind, 'risk')
+        renewal_notify.assert_not_called()
+        self.service.listener.close_goofish_pages.assert_not_awaited()
+
     async def test_repeated_renewal_failure_notifies_once_as_expiry(self):
         self.adopt_aged(3500)
         with patch('app.services.account_browser.RENEW_WAIT', 0), \

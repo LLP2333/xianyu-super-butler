@@ -4,8 +4,10 @@ import json
 from urllib.parse import parse_qs, urlsplit
 
 from app.config import API_ENDPOINTS
+from utils import risk_control
 from utils.manual_captcha import _from_playwright_cookies
 from utils.xianyu_utils import trans_cookies
+from .credentials import credential_error_kind
 from .tokens import BrowserToken, tokens
 
 
@@ -40,6 +42,8 @@ class TokenListener:
         self.expected_account = expected_account
         self.browser = browser
         self.on_capture = on_capture
+        # Called with the account id when the website's own Token request hits a slider/verification.
+        self.on_challenge = None
         self.task = None
         self.ready = asyncio.Event()
         self.error = None
@@ -75,7 +79,12 @@ class TokenListener:
             request_account = (trans_cookies(headers['cookie']) if headers.get('cookie') else {}).get('unb')
             if not request_account or (self.expected_account and request_account != self.expected_account):
                 return
-            parsed = token_response(response.url, response.request.post_data, await response.json())
+            payload = await response.json()
+            if credential_error_kind(payload) == risk_control.VERIFICATION_RISK:
+                if self.on_challenge:
+                    self.on_challenge(self.account_id)
+                return
+            parsed = token_response(response.url, response.request.post_data, payload)
             if not parsed:
                 return
             cookies = _from_playwright_cookies(await self.context.cookies([API_ENDPOINTS['token']]))
