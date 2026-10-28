@@ -3,7 +3,7 @@ import asyncio
 import time
 from loguru import logger
 from app.config import TOKEN_REFRESH_INTERVAL
-from app.services.risk_notifications import (RENEWAL_HINT, RENEWAL_TITLE,
+from app.services.risk_notifications import (RENEWAL_EVENT, RENEWAL_HINT, RENEWAL_TITLE,
                                              schedule_manual_verification_notification)
 from utils.account_browser.manager import BrowserManager
 from utils.account_browser.listener import TokenListener
@@ -421,7 +421,7 @@ class AccountBrowserService:
         invalidate_credentials(account_id, reason)
         logger.warning(f'【{account_id}】{reason}（连续第 {self.renew_failures} 次），{RENEW_RETRY} 秒后重试')
         if self.renew_failures == RENEW_NOTIFY_AFTER:
-            schedule_manual_verification_notification(account_id, error, RENEWAL_TITLE, RENEWAL_HINT)
+            schedule_manual_verification_notification(account_id, error, RENEWAL_TITLE, RENEWAL_HINT, RENEWAL_EVENT)
 
     async def run(self):
         failures = 0

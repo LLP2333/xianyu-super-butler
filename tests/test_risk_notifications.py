@@ -90,8 +90,10 @@ class RiskNotificationTests(unittest.IsolatedAsyncioTestCase):
     async def test_renewal_failure_notification_uses_its_own_title(self):
         risk_notifications.schedule_manual_verification_notification(
             'account', '未捕获到新的消息 Token',
-            risk_notifications.RENEWAL_TITLE, risk_notifications.RENEWAL_HINT)
+            risk_notifications.RENEWAL_TITLE, risk_notifications.RENEWAL_HINT, risk_notifications.RENEWAL_EVENT)
         await self.drain()
+        self.db.get_account_notifications.assert_called_once_with(
+            'account', user_id=7, event_type='cookie_invalid')
         text = self.sender.call_args.args[2]
         self.assertTrue(text.startswith('凭据到期 · 自动续期失败'))
         self.assertNotIn('平台风控', text)
